@@ -203,6 +203,8 @@ def _status(exc: Record) -> str:
         return "replaced"
     if exc.get("end") == "handled":
         return "handled"
+    if exc.get("type") == "SystemExit":
+        return "exit"  # `sys.exit()`: it ends the program, nothing handles it
     return "no handler seen"
 
 
@@ -251,6 +253,7 @@ def _rest(ix: Index, parent: str, kids: list[Record], cwd: str) -> dict[str, Any
     )
     return {
         "parent": parent or None,
+        "total": shown + len(kids),
         "not_shown": len(kids),
         "by_fn": dict(sorted(by_fn.items(), key=lambda item: -item[1])[:5]),
         "raised": sum(1 for kid in kids if kid.get("out") == "raised"),
@@ -410,6 +413,8 @@ def _exception_detail(target: Target, ix: Index, cwd: str) -> dict[str, Any]:
         if "path" in handler:
             commands.append(f"ormaos path {exc['addr']}")
         commands.append(f"ormaos tree {handled_in}")
+        if ix.io_count(ix.subtree(handled_in)):
+            commands.append(f"ormaos io {handled_in}")
     if through:
         commands.append(f"ormaos tree {through[0]['address']}")
     for key in ("replaced_by", "during"):
@@ -569,9 +574,13 @@ def path(
             [f"ormaos path {target.recording.name}"],
         )
     if "path" not in call:
+        via = ""
+        if target.kind != "call":
+            via = f", the call of {target.address}"
         raise Problem(
-            f"no path for {call['addr']} ({call.get('fn')}): its lines were not "
-            "recorded; lines are recorded only inside a scope given when recording",
+            f"no path for {call['addr']} ({call.get('fn')}{via}): its lines were "
+            "not recorded; lines are recorded only inside a scope given when "
+            "recording, so the program has to run again",
             [
                 _record_command(target.recording, _scope_of(call, cwd)),
                 f"ormaos tree {call['addr']}",

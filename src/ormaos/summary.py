@@ -1,7 +1,8 @@
 """The short summary printed on stderr after ``ormaos run``. At most 5 lines.
 
 Facts only. Every line starts with ``ormaos:`` so it can be told apart from
-the program's own stderr. The last line gives the addresses to ask about next.
+the program's own stderr. The last line gives the commands, with the addresses,
+for the next question.
 """
 
 import os
@@ -126,12 +127,12 @@ def summarize(recording: Recording, cwd: str = "") -> list[str]:
         more = f" (+{len(missing) - 1} more)" if len(missing) > 1 else ""
         lines.append(f"not collected: {first.get('what')}: {first.get('reason')}{more}")
 
-    following = [addr for _line, addr in highlights]
+    following = [f"ormaos exceptions {addr}" for _line, addr in highlights]
     calls = recording.calls
     if calls:
-        following.append(calls[0]["addr"])
+        following.append(f"ormaos tree {calls[0]['addr']}")
     last = f"saved in {display_path(recording.path, cwd)}"
     if following:
-        last += f", next: {' '.join(following)}"
+        last += f", next: {' | '.join(following)}"
     lines.append(last)
     return [PREFIX + line for line in lines[:MAX_LINES]]

@@ -92,8 +92,8 @@ def _tree(doc: Doc) -> list[str]:
         raised = f"; {rest['raised']} raised" if rest["raised"] else ""
         where = rest["parent"] or doc["recording"]
         lines.append(
-            f"... {rest['not_shown']} more calls in {where} ({names}{raised}): "
-            f"--offset {rest['offset']}"
+            f"... {rest['not_shown']} of the {rest['total']} calls directly below "
+            f"{where} are not shown ({names}{raised}): --offset {rest['offset']}"
         )
     return lines
 
