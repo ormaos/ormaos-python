@@ -20,12 +20,23 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: ormaos-python
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ormaos-python
+      # The demo app, checked out next to this repository.
+      - uses: actions/checkout@v4
+        with:
+          repository: ormaos/ormaos-examples
+          path: ormaos-examples
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          cache-dependency-glob: ormaos-python/uv.lock
       - name: Install
         run: uv sync --locked
       - name: Format
@@ -36,6 +47,19 @@ jobs:
         run: uv run mypy --strict src
       - name: Tests
         run: uv run pytest
+        env:
+          ORMAOS_DEMO_REQUIRED: "1"
+      # The way a user installs it: a built package of this checkout (not a
+      # published one) inside the environment of the demo app.
+      - name: Install this checkout into the demo's environment
+        run: |
+          uv venv ../ormaos-examples/order-sync/.venv
+          uv pip install --python ../ormaos-examples/order-sync/.venv/bin/python .
+      - name: Demo tests with the demo's environment
+        run: uv run pytest tests/test_demo.py
+        env:
+          ORMAOS_DEMO_REQUIRED: "1"
+          ORMAOS_DEMO_PYTHON: ${{ github.workspace }}/ormaos-examples/order-sync/.venv/bin/python
 
   gitleaks:
     name: gitleaks
