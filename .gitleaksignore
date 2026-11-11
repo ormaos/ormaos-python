@@ -1,0 +1,3 @@
+# A fake value planted by the secrets test in one old commit. Not a real key.
+# The test now makes its fake values at run time.
+a463637ed2e0997a06a9493b0fa0223eaf9e7eb3:tests/test_secrets.py:generic-api-key:11

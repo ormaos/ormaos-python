@@ -1,41 +1,39 @@
 """Shape always, value never: no planted value may reach `.ormaos/`."""
 
-import sys
+import secrets
 
 from conftest import Workdir
 
-SECRETS = {
-    "arg": "sk-live-PLANTED-ARGUMENT-0001",
-    "env": "PLANTED-ENV-VALUE-0002",
-    "message": "PLANTED-EXCEPTION-MESSAGE-0003",
-    "key": "PLANTED-DICT-KEY-0004",
-    "ret": "PLANTED-RETURN-VALUE-0005",
-    "child": "PLANTED-CHILD-ARGUMENT-0006",
-}
+NAMES = ("arg", "env", "message", "key", "ret", "child")
 
-PROGRAM = f"""\
+
+def make_secrets() -> dict[str, str]:
+    """Fake values, made at run time so no secret-looking text is in the repo."""
+    return {name: f"planted-{name}-{secrets.token_hex(12)}" for name in NAMES}
+
+
+def program(planted: dict[str, str]) -> str:
+    return f"""\
 import os, subprocess, sys
 
 def login(user, token, extra):
     try:
-        raise PermissionError("{SECRETS["message"]}" + token)
+        raise PermissionError("{planted["message"]}" + token)
     except PermissionError:
         pass
-    return "{SECRETS["ret"]}"
+    return "{planted["ret"]}"
 
-login("ana", "{SECRETS["arg"]}", {{"{SECRETS["key"]}": [1, 2]}})
-assert os.environ["PLANTED_VARIABLE"] == "{SECRETS["env"]}"
-subprocess.run(
-    [sys.executable, "-c", "import sys\\ndef f(a):\\n    return a\\nf(sys.argv[1])",
-     "{SECRETS["child"]}"],
-    check=True,
-)
+login("ana", "{planted["arg"]}", {{"{planted["key"]}": [1, 2]}})
+assert os.environ["PLANTED_VARIABLE"] == "{planted["env"]}"
+code = "import sys\\ndef f(a):\\n    return a\\nf(sys.argv[1])"
+subprocess.run([sys.executable, "-c", code, "{planted["child"]}"], check=True)
 """
 
 
 def test_no_planted_value_is_written(work: Workdir) -> None:
-    work.write("program.py", PROGRAM)
-    result = work.python("program.py", env={"PLANTED_VARIABLE": SECRETS["env"]})
+    planted = make_secrets()
+    work.write("program.py", program(planted))
+    result = work.python("program.py", env={"PLANTED_VARIABLE": planted["env"]})
     assert result.returncode == 0, result.stderr
 
     recording = work.last()
@@ -47,8 +45,7 @@ def test_no_planted_value_is_written(work: Workdir) -> None:
     assert len(files) >= 4
     for file in files:
         content = file.read_bytes()
-        for name, secret in SECRETS.items():
+        for name, secret in planted.items():
             assert secret.encode() not in content, f"{name} secret found in {file.name}"
-    for secret in SECRETS.values():
+    for secret in planted.values():
         assert secret not in "\n".join(result.summary)
-    assert sys.executable  # keep the import used
