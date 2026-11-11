@@ -77,7 +77,12 @@ def test_exceptions(work: Workdir, line_of: Callable[[str, str], int]) -> None:
     assert result.program_stderr == plain.stderr
 
     recording = work.last()
-    assert recording.not_collected == []
+    # Printing the traceback of the uncaught exception reads the source file,
+    # with no frame of user code left (in Python code from 3.13 on).
+    assert all(
+        note["what"].startswith("io with no line of user code")
+        for note in recording.not_collected
+    )
     exceptions = recording.exceptions
     assert [e["addr"] for e in exceptions] == [f"r1:e{n}" for n in range(1, 15)]
 
@@ -334,3 +339,132 @@ def test_handler_line_is_the_clause_that_matched(
     ]
     assert got == [(name, line_of(CLAUSES, name)) for name in names]
     assert all(e["swallowed"] for e in recording.exceptions)
+
+
+MANY_LINES = """\
+def boom():
+    raise KeyError("k")
+
+def second_of_two():
+    try:
+        boom()
+    except (ValueError,
+            OSError):
+        return 1
+    except (  # second_of_two
+        KeyError,
+        IndexError,
+    ) as err:
+        return 2
+
+def first_of_two():
+    try:
+        boom()
+    except (  # first_of_two
+        KeyError,
+        OSError,
+    ):
+        return 1
+    except ValueError:
+        return 2
+
+def only_one():
+    try:
+        boom()
+    except (  # only_one
+        KeyError,
+        OSError,
+    ):
+        return 1
+
+def bare_after():
+    try:
+        boom()
+    except (ValueError,
+            OSError):
+        return 1
+    except:  # bare_after
+        return 2
+
+def after_finally():
+    try:
+        try:
+            boom()
+        finally:
+            try:
+                int("x")
+            except (TypeError,
+                    ValueError):  # not this one
+                pass
+    except (OSError,
+            EOFError):
+        return 1
+    except (KeyError,  # after_finally
+            IndexError):
+        return 2
+
+second_of_two()
+first_of_two()
+only_one()
+bare_after()
+after_finally()
+"""
+
+
+def test_handler_line_when_the_types_of_a_clause_span_several_lines(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    work.write("many.py", MANY_LINES)
+    plain = work.plain(sys.executable, "many.py")
+    result = work.python("many.py")
+    assert (result.returncode, result.stdout) == (plain.returncode, plain.stdout)
+    assert result.program_stderr == plain.stderr
+    recording = work.last()
+    assert recording.not_collected == []
+    got = [
+        (e["handled"]["fn"], e["handled"]["line"])
+        for e in recording.exceptions
+        if e["type"] == "KeyError"
+    ]
+    names = ["second_of_two", "first_of_two", "only_one", "bare_after", "after_finally"]
+    assert got == [(name, line_of(MANY_LINES, name)) for name in names]
+
+
+STAR = """\
+def groups():
+    try:
+        raise ExceptionGroup("g", [KeyError("k"), ValueError("v")])
+    except* OSError:  # first clause
+        print("os")
+    except* KeyError:
+        print("key")
+    except* ValueError:
+        print("value")
+
+def plain():
+    try:
+        raise KeyError("k")
+    except KeyError:
+        pass
+
+for _ in range(3):
+    groups()
+plain()
+"""
+
+
+def test_an_except_star_handler_is_reported_in_not_collected(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    work.write("star.py", STAR)
+    plain = work.plain(sys.executable, "star.py")
+    result = work.python("star.py")
+    assert plain.stdout == "key\nvalue\n" * 3
+    assert (result.returncode, result.stdout) == (plain.returncode, plain.stdout)
+    assert result.program_stderr == plain.stderr
+    line = line_of(STAR, "first clause")
+    notes = work.last().not_collected
+    assert [n["what"] for n in notes] == [
+        f"which `except*` clause matched, at star.py:{line}"
+    ]
+    assert "first `except*` clause" in notes[0]["reason"]

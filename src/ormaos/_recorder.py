@@ -47,6 +47,8 @@ _IO_NAMES = frozenset({"getresponse", "_send_single_request"})
 
 _FLUSH_EVERY = 256
 _MAX_PENDING_HANDLED = 1000
+_MAX_CLAUSES = 64
+_MAX_PLACE_NOTES = 20
 
 _ALWAYS_NOT_COLLECTED = [
     {
@@ -62,9 +64,10 @@ _ALWAYS_NOT_COLLECTED = [
         "reason": "only exceptions seen in a user-code frame are recorded",
     },
     {
-        "what": "the `except` clause that matched, in two rare cases",
-        "reason": "for `except*`, and for a clause whose types span several "
-        "lines, the handler line may be an earlier clause of the same `try`",
+        "what": "which `except*` clause matched",
+        "reason": "for `except*` the handler line is the first clause of the "
+        "`try`; several clauses can each take a part of the group, and which "
+        "ones did is not recorded (the place is listed when it happens)",
     },
 ]
 _PATH_OFF = {
@@ -74,6 +77,8 @@ _PATH_OFF = {
 }
 
 type _Call = dict[str, Any] | None
+# One `except` clause: first offset, last offset, line.
+type _Clause = tuple[int, int, int]
 type _Entry = tuple[CodeType, _Call]
 
 
@@ -148,18 +153,26 @@ def _argv_shape() -> dict[str, Any]:
     return {"mode": mode, "target": target, "argc": len(orig)}
 
 
-_OPCODES: tuple[int, int, int, int] | None = None
+_OPCODES: tuple[int, ...] | None = None
+_OPNAMES = (
+    "CHECK_EXC_MATCH",
+    "POP_TOP",
+    "RERAISE",
+    "EXTENDED_ARG",
+    "CHECK_EG_MATCH",
+    "PUSH_EXC_INFO",
+    "POP_EXCEPT",
+    "WITH_EXCEPT_START",
+)
 
 
-def _opcodes() -> tuple[int, int, int, int]:
-    """CHECK_EXC_MATCH, POP_TOP, RERAISE, EXTENDED_ARG. Imported when needed."""
+def _opcodes() -> tuple[int, ...]:
+    """The numbers of the opcodes in ``_OPNAMES``. Imported when needed."""
     global _OPCODES
     if _OPCODES is None:
         import opcode
 
-        names = ("CHECK_EXC_MATCH", "POP_TOP", "RERAISE", "EXTENDED_ARG")
-        _OPCODES = tuple(opcode.opmap[name] for name in names)  # type: ignore[assignment]
-    assert _OPCODES is not None
+        _OPCODES = tuple(opcode.opmap[name] for name in _OPNAMES)
     return _OPCODES
 
 
@@ -170,40 +183,64 @@ def _line_at(code: CodeType, offset: int) -> int | None:
     return None
 
 
-def _has_more_clauses(code: CodeType, offset: int, line: int) -> bool:
-    """Is the handler at ``offset`` an `except X:` clause followed by another?
+def _clauses(code: CodeType, offset: int) -> tuple[list[_Clause], bool]:
+    """The `except` clauses of the handler that starts at ``offset``, and
+    whether it is an `except*` handler.
 
-    The first clause is ``<load X> CHECK_EXC_MATCH POP_JUMP_IF_FALSE target``.
-    When the target is RERAISE there is no other clause.
+    A clause is ``<load the types> CHECK_EXC_MATCH POP_JUMP_IF_FALSE next``.
+    For each one: the first and the last offset of that part (while a frame
+    is there, the clause is being tried) and the line of its `except`. A bare
+    `except:` at the end starts with POP_TOP. The list is empty for `finally`,
+    `with` and a `try` with only a bare `except:`.
     """
-    check, _pop_top, reraise, extended = _opcodes()
+    check, pop_top, reraise, extended, star, push, pop_except, with_start = _opcodes()
+    ends = (check, star, reraise, push, pop_except, with_start)
     raw = code.co_code
     end = len(raw)
-    pos = offset
-    limit = min(end, offset + 64)
-    while pos < limit and raw[pos] != check:
-        pos += 2
-    if pos >= limit or _line_at(code, pos) != line:
-        return False  # `finally`, `with`, or a bare `except:`
-    jump = pos + 2
-    if jump + 1 >= end or raw[jump] == extended:
-        return True  # cannot tell: watch the lines
-    after = jump + 2
-    while after < end and raw[after] == 0:  # inline cache entries
-        after += 2
-    target = after + 2 * raw[jump + 1]
-    return target >= end or raw[target] != reraise
-
-
-def _clause_lines(code: CodeType) -> frozenset[int]:
-    """The lines of every `except X:` clause in ``code``."""
-    check = _opcodes()[0]
-    raw = code.co_code
-    lines = set()
-    for start, end, line in code.co_lines():
-        if line is not None and check in raw[start:end:2]:
-            lines.add(line)
-    return frozenset(lines)
+    lines = list(code.co_lines())
+    out: list[_Clause] = []
+    start = offset
+    while start < end and len(out) < _MAX_CLAUSES:
+        pos = start + 2 if not out and raw[start] == push else start
+        if out and raw[pos] == pop_top:
+            bare = _line_at(code, pos)
+            if bare is not None:
+                out.append((pos, pos, bare))
+            break
+        scan = pos
+        while scan < end and raw[scan] not in ends:
+            scan += 2
+        if scan >= end:
+            break
+        if raw[scan] == star:
+            return [], True
+        line = _line_at(code, scan)
+        if raw[scan] != check or line is None:
+            break
+        # The types of a clause are written on the line of its `except` or
+        # below it. Anything above is other code (the body of a `finally`).
+        if any(
+            at is not None and at < line
+            for first, last, at in lines
+            if first < scan and last > pos
+        ):
+            break
+        jump = scan + 2
+        arg = 0
+        while jump < end and raw[jump] == extended:
+            arg = (arg | raw[jump + 1]) << 8
+            jump += 2
+        if jump >= end:
+            break
+        arg |= raw[jump + 1]
+        after = jump + 2
+        while after < end and raw[after] == 0:  # inline cache entries
+            after += 2
+        out.append((start, jump, line))
+        start = after + 2 * arg
+        if start >= end or raw[start] == reraise:
+            break
+    return out, False
 
 
 def _handler_line(code: CodeType, offset: int, fallback: int) -> int:
@@ -237,7 +274,9 @@ class Recorder:
         self._handled: dict[int, _Flight] = {}
         # Frames where we still have to see which `except` clause matches:
         # id(frame) -> (the exception, the code, the clause lines of the code).
-        self._watching: dict[int, tuple[_Flight, CodeType, frozenset[int]]] = {}
+        self._watching: dict[int, tuple[_Flight, CodeType, list[_Clause]]] = {}
+        self._clauses: dict[tuple[CodeType, int], tuple[list[_Clause], bool]] = {}
+        self._star_noted: set[tuple[str, int]] = set()
         self._call_ids = itertools.count(1)
         self._exc_ids = itertools.count(1)
         self._ncalls = 0
@@ -941,9 +980,17 @@ class Recorder:
             if user:
                 if self._watching:
                     self._unwatch(id(frame))
-                if _has_more_clauses(code, offset, line):
-                    self._watching[id(frame)] = (flight, code, _clause_lines(code))
+                found = self._clauses.get((code, offset))
+                if found is None:
+                    found = self._clauses[code, offset] = _clauses(code, offset)
+                clauses, star = found
+                if clauses:
+                    line = clauses[0][2]
+                if len(clauses) > 1:
+                    self._watching[id(frame)] = (flight, code, clauses)
                     _mon.set_local_events(self._tool, code, _EV.LINE)
+                if star:
+                    self._note_star(code.co_filename, line)
             flight.rec["handled"] = {
                 "file": code.co_filename,
                 "line": line,
@@ -996,15 +1043,15 @@ class Recorder:
             watch = self._watching.get(id(frame))
             if watch is None:
                 return  # another frame running the same code
-            flight, _code, clause_lines = watch
+            flight, _code, clauses = watch
             handled = flight.rec.get("handled")
             if handled is not None:
-                if line in clause_lines:
-                    handled["line"] = line  # this clause is being tried now
-                    return
-                if code.co_code[frame.f_lasti] == _opcodes()[1]:
-                    handled["line"] = line  # a bare `except:` starts with POP_TOP
-            # Any other line is the body of the clause that matched: done.
+                at = frame.f_lasti
+                for first, last, clause_line in clauses:
+                    if first <= at <= last:
+                        handled["line"] = clause_line  # this clause is being tried
+                        return
+            # Anywhere else is the body of the clause that matched: done.
             self._unwatch(id(frame))
         except Exception as err:
             self._fail(err)
@@ -1032,6 +1079,18 @@ class Recorder:
             return
         self._nlines += 1
         path.append(line)
+
+    def _note_star(self, filename: str, line: int) -> None:
+        place = (filename, line)
+        if place in self._star_noted or len(self._star_noted) >= _MAX_PLACE_NOTES:
+            return
+        self._star_noted.add(place)
+        self._note(
+            f"which `except*` clause matched, at {os.path.basename(filename)}:{line}",
+            "the handler line of an exception handled there is the first "
+            "`except*` clause of the `try`; which clauses took a part of the "
+            "group is not recorded",
+        )
 
     def _unwatch(self, frame_id: int) -> None:
         watch = self._watching.pop(frame_id, None)
