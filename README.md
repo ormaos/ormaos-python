@@ -169,11 +169,19 @@ Shape always, value never: Ormaos records types, lengths and structure (`{"type"
 - The Python that the command starts must have `ormaos` installed in its environment. If not, the command still runs and the summary says that no Python process was recorded.
 - "Your code" is every file outside the standard library and outside `site-packages`. Set `ORMAOS_ONLY` to a list of paths to narrow it.
 - The handler line is the `except` clause that matched, also when its types are written on several lines. For `except*` it is the first clause of the `try` (several clauses can each take a part of the group); the place is listed in `not_collected` when it happens.
-- Recording costs time on every call, and the files are large for long runs. At most 200,000 calls, 50,000 exceptions and 200,000 lines are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`, `ORMAOS_MAX_LINES`); the rest is listed in `not_collected`. The cost is not measured yet.
+- Recording costs time on every call, and the files are large for long runs. At most 200,000 calls, 50,000 exceptions and 200,000 lines are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`, `ORMAOS_MAX_LINES`); the rest is listed in `not_collected`. `bench/` measures the cost (see "Measuring the cost").
 - `path` has the lines of the functions inside the scope, not of the functions they call (those appear as calls).
 - At most 100,000 I/O events are kept per process (`ORMAOS_MAX_IO`). The same event repeated at the same line is one event with a count.
 - A process that is killed, or that ends with `os._exit`, loses its last events. The recording says so.
 - Tested on Linux only.
+
+## Measuring the cost
+
+```bash
+uv run python bench/run.py --runs 20
+```
+
+`bench/run.py` runs two fixed workloads (`bench/workloads/cpu_bound.py`: calls of small pure-Python functions; `bench/workloads/io_bound.py`: a SQLite file and small files), each N times without Ormaos and N times with each capability set: context only, calls and exceptions, the same with `--path`, the same with I/O (the default of `ormaos run`). It times the whole command and writes `bench/RESULTS.md`: one table per workload with the median, the spread (p25-p75 and min-max), what one run recorded, and the machine, the OS and the Python version. `--out FILE` writes somewhere else. Linux and macOS.
 
 ## Requirements
 
