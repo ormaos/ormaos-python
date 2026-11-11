@@ -139,7 +139,7 @@ def test_summary_shows_the_swallowed_exception(
     assert summary[-1] == "ormaos: saved in .ormaos/r1, next: r1:e1 r1:e14 r1:c1"
 
 
-def test_the_plan_example(work: Workdir) -> None:
+def test_swallowed_exception_in_a_command_string(work: Workdir) -> None:
     code = (
         "def f():\n    raise ValueError('x')\n"
         "try:\n    f()\nexcept ValueError:\n    pass\n"
