@@ -59,8 +59,9 @@ _ALWAYS_NOT_COLLECTED = [
         "reason": "only exceptions seen in a user-code frame are recorded",
     },
     {
-        "what": "which `except` clause matched",
-        "reason": "the handler line is the first clause of the `try` statement",
+        "what": "the `except` clause that matched, in two rare cases",
+        "reason": "for `except*`, and for a clause whose types span several "
+        "lines, the handler line may be an earlier clause of the same `try`",
     },
     {"what": "path", "reason": "line-by-line recording is not implemented yet"},
     {"what": "io", "reason": "I/O recording is not implemented yet"},
@@ -130,6 +131,64 @@ def _argv_shape() -> dict[str, Any]:
     return {"mode": mode, "target": target, "argc": len(orig)}
 
 
+_OPCODES: tuple[int, int, int, int] | None = None
+
+
+def _opcodes() -> tuple[int, int, int, int]:
+    """CHECK_EXC_MATCH, POP_TOP, RERAISE, EXTENDED_ARG. Imported when needed."""
+    global _OPCODES
+    if _OPCODES is None:
+        import opcode
+
+        names = ("CHECK_EXC_MATCH", "POP_TOP", "RERAISE", "EXTENDED_ARG")
+        _OPCODES = tuple(opcode.opmap[name] for name in names)  # type: ignore[assignment]
+    assert _OPCODES is not None
+    return _OPCODES
+
+
+def _line_at(code: CodeType, offset: int) -> int | None:
+    for start, end, line in code.co_lines():
+        if start <= offset < end:
+            return line
+    return None
+
+
+def _has_more_clauses(code: CodeType, offset: int, line: int) -> bool:
+    """Is the handler at ``offset`` an `except X:` clause followed by another?
+
+    The first clause is ``<load X> CHECK_EXC_MATCH POP_JUMP_IF_FALSE target``.
+    When the target is RERAISE there is no other clause.
+    """
+    check, _pop_top, reraise, extended = _opcodes()
+    raw = code.co_code
+    end = len(raw)
+    pos = offset
+    limit = min(end, offset + 64)
+    while pos < limit and raw[pos] != check:
+        pos += 2
+    if pos >= limit or _line_at(code, pos) != line:
+        return False  # `finally`, `with`, or a bare `except:`
+    jump = pos + 2
+    if jump + 1 >= end or raw[jump] == extended:
+        return True  # cannot tell: watch the lines
+    after = jump + 2
+    while after < end and raw[after] == 0:  # inline cache entries
+        after += 2
+    target = after + 2 * raw[jump + 1]
+    return target >= end or raw[target] != reraise
+
+
+def _clause_lines(code: CodeType) -> frozenset[int]:
+    """The lines of every `except X:` clause in ``code``."""
+    check = _opcodes()[0]
+    raw = code.co_code
+    lines = set()
+    for start, end, line in code.co_lines():
+        if line is not None and check in raw[start:end:2]:
+            lines.add(line)
+    return frozenset(lines)
+
+
 def _handler_line(code: CodeType, offset: int, fallback: int) -> int:
     """The source line of the handler that starts at ``offset``."""
     for _start, end, line in code.co_lines():
@@ -154,6 +213,9 @@ class Recorder:
         self._suspended: dict[int, _Entry] = {}
         self._active: dict[int, _Flight] = {}
         self._handled: dict[int, _Flight] = {}
+        # Frames where we still have to see which `except` clause matches:
+        # id(frame) -> (the exception, the code, the clause lines of the code).
+        self._watching: dict[int, tuple[_Flight, CodeType, frozenset[int]]] = {}
         self._call_ids = itertools.count(1)
         self._exc_ids = itertools.count(1)
         self._ncalls = 0
@@ -190,6 +252,9 @@ class Recorder:
             for event, callback in self._callbacks():
                 _mon.register_callback(tool, event, callback)
                 mask |= event
+            # LINE is never on everywhere: only for one code object, for the
+            # few lines after an exception enters a `try` with several clauses.
+            _mon.register_callback(tool, _EV.LINE, self._line)
             self._install_fault()
             _mon.set_events(tool, mask)
         except Exception as err:
@@ -224,8 +289,12 @@ class Recorder:
             return
         self._tool = -1
         _mon.set_events(tool, 0)
+        for _flight, code, _lines in list(self._watching.values()):
+            _mon.set_local_events(tool, code, 0)
+        self._watching = {}
         for event, _callback in self._callbacks():
             _mon.register_callback(tool, event, None)
+        _mon.register_callback(tool, _EV.LINE, None)
         _mon.free_tool_id(tool)
 
     def _open(self, forked: bool) -> None:
@@ -264,6 +333,9 @@ class Recorder:
             self._suspended = {}
             self._active = {}
             self._handled = {}
+            for _flight, code, _lines in list(self._watching.values()):
+                _mon.set_local_events(self._tool, code, 0)
+            self._watching = {}
             self._ncalls = 0
             self._nexc = 0
             self._t0 = time.perf_counter_ns()
@@ -548,6 +620,8 @@ class Recorder:
         try:
             if not self._user(code):
                 return _DISABLE
+            if self._watching:
+                self._unwatch(id(sys._getframe(1)))
             self._close(code, "returned", retval)
         except Exception as err:
             self._fail(err)
@@ -570,6 +644,8 @@ class Recorder:
                         handled.rec["replaced_by"] = flight.rec["id"]
                         self._finish_handled(handled)
             if self._user(code):
+                if self._watching:
+                    self._unwatch(id(sys._getframe(1)))
                 self._close(code, "raised", None)
         except Exception as err:
             self._fail(err)
@@ -578,6 +654,8 @@ class Recorder:
         try:
             if not self._user(code):
                 return _DISABLE
+            if self._watching:
+                self._unwatch(id(sys._getframe(1)))
             entry = self._pop(code)
             if entry is not None:
                 self._suspended[id(sys._getframe(1))] = entry
@@ -717,9 +795,16 @@ class Recorder:
                 return
             frame = sys._getframe(1)
             user = self._user(code)
+            line = _handler_line(code, offset, frame.f_lineno)
+            if user:
+                if self._watching:
+                    self._unwatch(id(frame))
+                if _has_more_clauses(code, offset, line):
+                    self._watching[id(frame)] = (flight, code, _clause_lines(code))
+                    _mon.set_local_events(self._tool, code, _EV.LINE)
             flight.rec["handled"] = {
                 "file": code.co_filename,
-                "line": _handler_line(code, offset, frame.f_lineno),
+                "line": line,
                 "fn": code.co_qualname,
                 "user": user,
                 "call": self._top(self._thread_state().stack) if user else None,
@@ -745,6 +830,8 @@ class Recorder:
                 return
             flight = self._handled.pop(key, None)
             if flight is not None:
+                if self._watching:
+                    self._unwatch(id(sys._getframe(1)))
                 flight.rec.pop("handled", None)
                 flight.unwound = 0
                 self._active[key] = flight
@@ -752,6 +839,34 @@ class Recorder:
                 self._begin(code, sys._getframe(1), exc, key)
         except Exception as err:
             self._fail(err)
+
+    def _line(self, code: CodeType, line: int) -> None:
+        """Runs only while we watch a frame to see which clause matches."""
+        try:
+            frame = sys._getframe(1)
+            watch = self._watching.get(id(frame))
+            if watch is None:
+                return  # another frame running the same code
+            flight, _code, clause_lines = watch
+            handled = flight.rec.get("handled")
+            if handled is not None:
+                if line in clause_lines:
+                    handled["line"] = line  # this clause is being tried now
+                    return
+                if code.co_code[frame.f_lasti] == _opcodes()[1]:
+                    handled["line"] = line  # a bare `except:` starts with POP_TOP
+            # Any other line is the body of the clause that matched: done.
+            self._unwatch(id(frame))
+        except Exception as err:
+            self._fail(err)
+
+    def _unwatch(self, frame_id: int) -> None:
+        watch = self._watching.pop(frame_id, None)
+        if watch is None or self._tool < 0:
+            return
+        code = watch[1]
+        if not any(other[1] is code for other in self._watching.values()):
+            _mon.set_local_events(self._tool, code, 0)
 
     def _finish_handled(self, flight: _Flight) -> None:
         rec = flight.rec

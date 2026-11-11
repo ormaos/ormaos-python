@@ -218,3 +218,116 @@ print(asyncio.run(main()))
     assert ("OSError", "main") in swallowed
     outcomes = {c["fn"]: c["out"] for c in recording.calls}
     assert outcomes["main"] == "returned" and outcomes["fails"] == "raised"
+
+
+CLAUSES = """\
+def boom():
+    raise KeyError("k")
+
+def second():
+    try:
+        boom()
+    except ValueError:
+        return 1
+    except KeyError as err:  # second
+        return 2
+
+def bare_last():
+    try:
+        boom()
+    except ValueError:
+        return 1
+    except:  # bare_last
+        return 2
+
+def third_on_one_line():
+    try:
+        boom()
+    except ValueError: pass
+    except OSError: pass
+    except KeyError: pass  # third_on_one_line
+    return 3
+
+def first_of_two():
+    try:
+        boom()
+    except (KeyError, OSError):  # first_of_two
+        return 1
+    except ValueError:
+        return 2
+
+def none_matches():
+    try:
+        boom()
+    except ValueError:
+        return 1
+    except OSError:
+        return 2
+
+def outer():
+    try:
+        none_matches()
+    except Exception:  # outer
+        pass
+
+def with_finally():
+    try:
+        try:
+            boom()
+        finally:
+            done = True
+    except OSError:
+        return 1
+    except KeyError:  # with_finally
+        return 2
+
+def recursive(depth):
+    try:
+        if depth:
+            recursive(depth - 1)
+        boom()
+    except ValueError:
+        return 1
+    except LookupError:  # recursive
+        return 2
+
+second()
+bare_last()
+third_on_one_line()
+first_of_two()
+outer()
+with_finally()
+recursive(2)
+for _ in range(3):
+    second()
+"""
+
+
+def test_handler_line_is_the_clause_that_matched(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    work.write("clauses.py", CLAUSES)
+    plain = work.plain(sys.executable, "clauses.py")
+    result = work.python("clauses.py")
+    assert (result.returncode, result.stdout) == (plain.returncode, plain.stdout)
+    assert result.program_stderr == plain.stderr
+
+    recording = work.last()
+    assert recording.not_collected == []
+    got = [(e["handled"]["fn"], e["handled"]["line"]) for e in recording.exceptions]
+    names = [
+        "second",
+        "bare_last",
+        "third_on_one_line",
+        "first_of_two",
+        "outer",
+        "with_finally",
+        "recursive",
+        "recursive",
+        "recursive",
+        "second",
+        "second",
+        "second",
+    ]
+    assert got == [(name, line_of(CLAUSES, name)) for name in names]
+    assert all(e["swallowed"] for e in recording.exceptions)

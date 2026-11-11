@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -32,7 +33,7 @@ def test_module_entry_point() -> None:
 
 
 def test_installed_script() -> None:
-    script = shutil.which("ormaos")
+    script = shutil.which("ormaos", path=str(Path(sys.executable).parent))
     assert script is not None, "the `ormaos` script is not installed"
     result = subprocess.run(
         [script, "--version"], capture_output=True, text=True, check=False
