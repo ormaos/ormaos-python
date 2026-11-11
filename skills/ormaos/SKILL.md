@@ -51,6 +51,7 @@ An address belongs to one recording: `r3:c42` and `r4:c42` are not the same call
 | `ormaos tree <addr>` | The calls below a call, or the top of a recording: shape of arguments and results, file and line, duration, exceptions handled there, I/O count. |
 | `ormaos io <addr>` | SQL statements, files, subprocesses and HTTP requests of a recording or a call, grouped by the line of code that caused them, with counts. For one I/O event: where it happened. |
 | `ormaos path <addr>` | The lines a call ran, in order, with the calls it made and the exceptions it caught in between. |
+| `ormaos diff r3 r4` | What two recordings did differently: calls, exceptions and I/O that one has and the other has not, or has more of. Matched by file, function and line of the code and by order, never by address. |
 
 Options on every verb: `--json` (one JSON document on stdout, also for errors, with `kind`, `version`, `next` and `next_commands`). On `tree`, `exceptions`, `path` and `io`: `--limit N` and `--offset N`. On `tree`: `--depth N`. On `io`: `--kind sqlite|file|subprocess|http`.
 

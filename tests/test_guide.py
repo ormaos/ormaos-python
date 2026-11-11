@@ -18,7 +18,7 @@ def verbs() -> set[str]:
     return set(action.choices)
 
 
-_VERB = re.compile(r"ormaos (run|guide|" + "|".join(READERS) + r")\b([^\n`|]*)")
+_VERB = re.compile(r"ormaos (run|guide|diff|" + "|".join(READERS) + r")\b([^\n`|]*)")
 _ARGUMENT = re.compile(r"<addr>|\[r3\]|last|r\d+(:[cei]\d+)?|--[a-z-]+")
 
 
@@ -53,8 +53,8 @@ def test_the_guide_is_short_and_has_the_four_parts(work: Workdir) -> None:
 
 
 def test_the_guide_names_every_verb_and_only_verbs_that_exist() -> None:
-    assert verbs() == {"run", "guide", *READERS}
-    for verb in ("run", *READERS):
+    assert verbs() == {"run", "guide", "diff", *READERS}
+    for verb in ("run", "diff", *READERS):
         assert f"ormaos {verb} " in GUIDE
     parser = build_parser()
     for text in (GUIDE, SKILL.read_text(encoding="utf-8")):
@@ -127,7 +127,7 @@ def test_the_skill_file_has_the_standard_header() -> None:
     assert fields["name"] == SKILL.parent.name == "ormaos"
     assert 50 < len(fields["description"]) <= 1024
     assert body.lstrip().startswith("# Ormaos")
-    for verb in ("run", "guide", *READERS):
+    for verb in ("run", "guide", "diff", *READERS):
         assert f"ormaos {verb}" in body
     for address in ("last", "r3:c42", "r3:e5", "r3:i7"):
         assert address in body and address in GUIDE

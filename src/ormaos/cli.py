@@ -172,6 +172,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("sqlite", "file", "subprocess", "http"),
         help="show only this kind of I/O",
     )
+    diff = commands.add_parser(
+        "diff",
+        help="show what two recordings did differently",
+        description=(
+            "Compares two recordings: the calls, the exceptions and the I/O "
+            "that one has and the other has not, or has more of. Events are "
+            "matched by where they are in the code (file, function, line) and "
+            "by order, never by address. Differences are described, not judged."
+        ),
+    )
+    diff.add_argument("a", help="a recording: r3, 3 or last")
+    diff.add_argument("b", help="the other recording")
+    diff.add_argument("--json", action="store_true", help="print JSON on stdout")
+    diff.add_argument(
+        "--limit",
+        type=_positive,
+        default=20,
+        metavar="N",
+        help="show at most N differences of each kind (default 20)",
+    )
     guide = commands.add_parser(
         "guide",
         help="how to use ormaos, for a coding agent (start here)",
@@ -295,6 +315,26 @@ def _read(args: argparse.Namespace) -> int:
     return _answer(build, args.json)
 
 
+def _diff(args: argparse.Namespace) -> int:
+    from ormaos import verbs
+    from ormaos.diff import diff
+
+    def build() -> dict[str, Any]:
+        sides = []
+        names = [ref.partition(":")[0] for ref in (args.a, args.b)]
+        for ref in (args.a, args.b):
+            target = verbs.resolve(ref)
+            if target.kind != "recording":
+                raise verbs.Problem(
+                    f"`diff` takes two recordings; {target.address} is inside one",
+                    [f"ormaos diff {names[0]} {names[1]}"],
+                )
+            sides.append(target.recording)
+        return diff(sides[0], sides[1], args.limit)
+
+    return _answer(build, args.json)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     _Parser.argv = sys.argv[1:] if argv is None else argv
@@ -310,6 +350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(command, json_out=args.json_out, path=args.path, io=not args.no_io)
     if args.verb in ("show", "tree", "exceptions", "path", "io"):
         return _read(args)
+    if args.verb == "diff":
+        return _diff(args)
     if args.verb == "guide":
         return _guide(args, parser)
     parser.print_help()

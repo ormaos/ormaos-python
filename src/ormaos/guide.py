@@ -39,9 +39,9 @@ ends with `next:`, the commands for the next question.
   ormaos io <addr>          SQL, files, subprocesses and HTTP of a recording or
                             a call, by line of code, with counts
   ormaos path <addr>        the lines a call ran, in order; needs a recording
-                            made with: ormaos run --path <file.py:function> --
-                            <command> (the error message gives the command;
-                            it runs the program again, side effects included)
+                            made with `ormaos run --path file.py:function --
+                            <command>` (the program runs again; see the error)
+  ormaos diff r3 r4         what r4 did differently from r3, by place in code
 An exception address given to tree, io or path means the call that handled it.
 Exceptions are: "swallowed" (entered an `except`, not raised again; "handled
 at" is the line of that `except`), "uncaught" (ended the program), "replaced"

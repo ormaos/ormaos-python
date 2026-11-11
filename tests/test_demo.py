@@ -300,6 +300,71 @@ def test_io_shows_that_the_orders_with_a_bad_sku_never_reach_the_inventory(
 
 
 @pytest.mark.parametrize("source", ["csv", "api"])
+def test_diff_of_two_runs_of_the_same_code_is_nearly_empty(
+    demo: Demo, source: str
+) -> None:
+    for _ in range(2):
+        demo.reset()
+        assert demo.recorded("--source", source).returncode == 0
+
+    doc = demo.ask("diff", "r1", "r2")
+
+    assert doc["context"] == []
+    for name in ("calls", "exceptions", "io"):
+        assert doc[name]["compared"] and doc[name]["places"] > 0
+        assert doc[name]["differences"] == [], doc[name]["differences"]
+    assert doc["not_collected"]["only_a"] == doc["not_collected"]["only_b"] == []
+    # Two lines for the recordings, one per kind, what is not compared, `next:`.
+    assert len(demo.say("diff", "r1", "r2")) == 8
+
+
+def test_diff_before_and_after_the_fix_shows_what_changed(demo: Demo) -> None:
+    demo.reset()
+    orders = demo.orders()
+    bad = len([o for o in orders if not SKU_FORMAT.fullmatch(o["sku"])])
+    good = len(orders) - bad
+    assert bad > 0
+    assert demo.recorded().returncode == 0
+
+    # The fix, on this temporary copy: clean the SKU when the row is parsed.
+    parse = demo.path / "parse.py"
+    source = parse.read_text(encoding="utf-8")
+    assert source.count('sku=row["sku"],') == 1
+    fixed = source.replace('sku=row["sku"],', 'sku=row["sku"].strip().upper(),')
+    parse.write_text(fixed, encoding="utf-8")
+    demo.reset()
+    assert demo.recorded().returncode == 0
+
+    doc = demo.ask("diff", "r1", "r2")
+
+    # The swallowed exception is gone.
+    (gone,) = doc["exceptions"]["differences"]
+    assert gone["type"] == "validate.SkuFormatError" and gone["status"] == "swallowed"
+    assert gone["handled_at"] == {"file": "job.py", "fn": "sync_orders"}
+    assert gone["a"]["handled_line"] == demo.line_with("job.py", "except Exception")
+    assert (gone["a"]["count"], gone["b"]["count"]) == (bad, 0)
+    # The inventory writes of the orders that were skipped are there.
+    io = {entry["sql"]: entry for entry in doc["io"]["differences"]}
+    update = io["UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?"]
+    assert (update["file"], update["fn"]) == ("inventory.py", "apply_order")
+    assert (update["a"]["count"], update["b"]["count"]) == (good, len(orders))
+    (insert,) = [entry for sql, entry in io.items() if sql.startswith("INSERT INTO")]
+    assert (insert["a"]["count"], insert["b"]["count"]) == (good, len(orders))
+    # And the calls: every order now reaches `apply_order`.
+    calls = {entry["fn"]: entry for entry in doc["calls"]["differences"]}
+    applied = calls["apply_order"]
+    assert (applied["a"]["count"], applied["b"]["count"]) == (good, len(orders))
+    assert (calls["check_sku"]["a"]["raised"], calls["check_sku"]["b"]["raised"]) == (
+        bad,
+        0,
+    )
+    assert doc["next_commands"][0] == f"ormaos exceptions {gone['a']['first']}"
+    said = "\n".join(demo.say("diff", "r1", "r2"))
+    assert f"job.py:{gone['a']['handled_line']}: {bad} in r1, none in r2" in said
+    assert f"in apply_order: {good} in r1, {len(orders)} in r2" in said
+
+
+@pytest.mark.parametrize("source", ["csv", "api"])
 def test_the_summary_shows_the_swallowed_sku_exception(demo: Demo, source: str) -> None:
     demo.reset()
     bad = [o for o in demo.orders() if not SKU_FORMAT.fullmatch(o["sku"])]

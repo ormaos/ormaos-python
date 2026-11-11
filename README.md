@@ -45,6 +45,7 @@ ormaos exceptions r1:e1    # one exception: where raised, the calls it left, whe
 ormaos tree r1:c7          # the calls below a call: shapes, results, durations
 ormaos path r1:c7          # the lines that call ran, in order
 ormaos io r1:c7            # the I/O of that call and of the calls below it
+ormaos diff r1 r2          # what r2 did differently from r1
 ```
 
 ```
@@ -116,6 +117,28 @@ Limits of `io`. The ones that depend on the run are listed in `not_collected` of
 - I/O that no line of your code is waiting for is not recorded. What the import system does is never counted; the rest (library threads, the interpreter printing a traceback) is counted in one line.
 - Other databases, and anything a C library does by itself, are never seen.
 - A quoted name in SQL (`"stock"`) is kept only where a name is expected (after `FROM`, `INTO`, `UPDATE`, `JOIN`, ..., or next to a dot); anywhere else it is shown as `?`.
+
+### Two recordings: `ormaos diff`
+
+```
+$ ormaos diff r2 r3
+r2 -> r3, matched by place in the code and order, not by address
+  r2: exit 0, 260 calls, 7 exceptions, 182 io events
+  r3: exit 0, 272 calls, 1 exception, 218 io events
+calls: 4 of 27 places differ
+  check_sku at validate.py:22: 36 calls in both; 6 raised in r2, none in r3; call 7 raised in r2 and returned in r3  [r2:c154 r3:c154]
+  apply_order at inventory.py:59: 30 calls in r2, 36 in r3  [r2:c132 r3:c132]
+  ...
+exceptions: 1 of 2 groups differ
+  swallowed validate.SkuFormatError, raised at validate.py:24, handled at job.py:57: 6 in r2, none in r3  [r2:e1]
+io: 6 of 8 groups differ
+  sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?  at inventory.py:76 in apply_order: 30 in r2, 36 in r3  [r2:i6 r3:i6]
+  ...
+not compared: values, shapes of arguments and results, durations, cpu and memory, the lines of `path`, which process or thread an event was in
+next: ormaos exceptions r2:e1 | ormaos tree r2:c153 | ormaos io r2:i3 | ormaos tree r3:c153 | ormaos io r3:i3
+```
+
+An address belongs to one recording, so `diff` never matches by address. It matches a call, an exception or an I/O event by where it is in the code (file, function, line), and events at the same place by order: the first with the first. When a line moved between the two recordings and the file and function leave no doubt, the place is still matched and both lines are shown. The answer says what each recording has, with the counts; it does not say which one is right. Two recordings of the same code and the same input give `the same in both` three times. A kind of event that one recording did not record (`--no-io`) is not compared, and the answer says so. `--limit N` shows more differences, `--json` prints the document.
 
 ### For coding agents: `ormaos guide`
 

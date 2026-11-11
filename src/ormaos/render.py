@@ -367,6 +367,126 @@ def _io_event(doc: Doc) -> list[str]:
     return lines
 
 
+def _in_each(count_a: int, count_b: int, a: str, b: str, word: str = "") -> str:
+    """``30 in r1, 36 in r2``; a count of zero reads ``none``."""
+    if count_a == count_b:
+        return f"{count_a}{word} in both"
+    one = f"{count_a}{word}" if count_a else "none"
+    other = str(count_b) if count_b else "none"
+    return f"{one} in {a}, {other} in {b}"
+
+
+def _diff_line(entry: Doc, a: str, b: str) -> str:
+    """``inventory.py:76`` and, when the line moved, the line in the other."""
+    line_a, line_b = entry["a"].get("line"), entry["b"].get("line")
+    place = f"{entry.get('file')}:{line_a if line_a is not None else line_b}"
+    if line_a is not None and line_b is not None and line_a != line_b:
+        place += f" (line {line_b} in {b})"
+    return place
+
+
+def _addresses(entry: Doc) -> str:
+    firsts = [entry[side]["first"] for side in ("a", "b") if entry[side].get("first")]
+    return f"  [{' '.join(firsts)}]"
+
+
+def _diff_section(doc: Doc, name: str, word: str) -> str:
+    section = doc[name]
+    if not section["compared"]:
+        return f"{name}: not compared ({section['reason']})"
+    places = _plural(section["places"], word)
+    if not section["differ"]:
+        return f"{name}: the same in both ({places})"
+    return f"{name}: {section['differ']} of {places} differ"
+
+
+def _exception_place(entry: Doc, side: str, other: str) -> str:
+    raised = f"{entry['raised_at'].get('file')}:{entry[side].get('raised_line')}"
+    text = f"raised at {raised}"
+    if entry.get("handled_at"):
+        handled = entry["handled_at"].get("file")
+        text += f", handled at {handled}:{entry[side].get('handled_line')}"
+    there = entry[other]
+    if there["count"] and (
+        there.get("raised_line") != entry[side].get("raised_line")
+        or there.get("handled_line") != entry[side].get("handled_line")
+    ):
+        lines = [str(there.get("raised_line"))]
+        if entry.get("handled_at"):
+            lines.append(str(there.get("handled_line")))
+        text += f" (lines {' and '.join(lines)} in the other)"
+    return text
+
+
+def _diff(doc: Doc) -> list[str]:
+    a, b = doc["a"]["recording"], doc["b"]["recording"]
+    lines = [f"{a} -> {b}, matched by place in the code and order, not by address"]
+    for side in (doc["a"], doc["b"]):
+        code = side.get("exit_code")
+        lines.append(
+            f"  {side['recording']}: "
+            + ("no exit code" if code is None else f"exit {code}")
+            + f", {_plural(side['calls'], 'call')}, "
+            f"{_plural(side['exceptions'], 'exception')}, "
+            f"{_plural(side['io'], 'io event')}"
+        )
+    for item in doc["context"]:
+        what = str(item["what"]).replace("_", " ")
+        if isinstance(item["a"], list):
+            one = " ".join(str(part) for part in item["a"]) or "none"
+            other = " ".join(str(part) for part in item["b"]) or "none"
+        else:
+            one, other = str(item["a"]), str(item["b"])
+        lines.append(f"{what}: {_cut(one, 60)} in {a}, {_cut(other, 60)} in {b}")
+    lines.append(_diff_section(doc, "calls", "place"))
+    for entry in doc["calls"]["differences"]:
+        text = f"  {entry['fn']} at {_diff_line(entry, a, b)}: "
+        text += _in_each(entry["a"]["count"], entry["b"]["count"], a, b, " calls")
+        if entry["a"]["raised"] != entry["b"]["raised"]:
+            text += "; " + _in_each(
+                entry["a"]["raised"], entry["b"]["raised"], a, b, " raised"
+            )
+        end = entry.get("first_other_end")
+        if end:
+            text += (
+                f"; call {end['nth']} {end['a']['out']} in {a} and "
+                f"{end['b']['out']} in {b}  "
+                f"[{end['a']['address']} {end['b']['address']}]"
+            )
+        else:
+            text += _addresses(entry)
+        lines.append(text)
+    lines.append(_diff_section(doc, "exceptions", "group"))
+    for entry in doc["exceptions"]["differences"]:
+        side, other = ("a", "b") if entry["a"]["count"] else ("b", "a")
+        lines.append(
+            f"  {entry['status']} {entry['type']}, "
+            f"{_exception_place(entry, side, other)}: "
+            + _in_each(entry["a"]["count"], entry["b"]["count"], a, b)
+            + _addresses(entry)
+        )
+    lines.append(_diff_section(doc, "io", "group"))
+    for entry in doc["io"]["differences"]:
+        lines.append(
+            f"  {entry['label']}  at {_diff_line(entry, a, b)} in {entry['fn']}: "
+            + _in_each(entry["a"]["count"], entry["b"]["count"], a, b)
+            + _addresses(entry)
+        )
+    more = sum(doc[name]["not_shown"] for name in ("calls", "exceptions", "io"))
+    if more:
+        lines.append(f"... {more} more differences: --limit {doc['limit'] + more}")
+    notes = doc["not_collected"]
+    for key, name in (("only_a", a), ("only_b", b)):
+        for note in notes[key][:3]:
+            lines.append(f"not collected only in {name}: {note['what']}")
+        if len(notes[key]) > 3:
+            lines.append(f"... and {len(notes[key]) - 3} more only in {name}")
+    lines.append(
+        "not compared: " + ", ".join(str(n["what"]) for n in doc["not_compared"])
+    )
+    return lines
+
+
 def _error(doc: Doc) -> list[str]:
     return [str(doc["error"])]
 
@@ -380,6 +500,7 @@ _RENDERERS = {
     "path": _path,
     "io": _io,
     "io_event": _io_event,
+    "diff": _diff,
     "error": _error,
 }
 
