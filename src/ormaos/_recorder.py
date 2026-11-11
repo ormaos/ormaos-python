@@ -42,6 +42,9 @@ _STDLIB_DIR = os.path.dirname(os.path.abspath(os.__file__)) + os.sep
 _SITE_MARKS = (f"site-packages{os.sep}", f"dist-packages{os.sep}")
 _USER_PSEUDO_FILES = ("<string>", "<stdin>")
 
+# Library functions whose start and return the I/O recorder looks at.
+_IO_NAMES = frozenset({"getresponse", "_send_single_request"})
+
 _FLUSH_EVERY = 256
 _MAX_PENDING_HANDLED = 1000
 
@@ -63,7 +66,6 @@ _ALWAYS_NOT_COLLECTED = [
         "reason": "for `except*`, and for a clause whose types span several "
         "lines, the handler line may be an earlier clause of the same `try`",
     },
-    {"what": "io", "reason": "I/O recording is not implemented yet"},
 ]
 _PATH_OFF = {
     "what": "path",
@@ -223,6 +225,11 @@ class Recorder:
         self._finished = False
         self._pid = os.getpid()
         self._t0 = time.perf_counter_ns()
+        # The thread that is writing the recording right now, 0 if none. The
+        # I/O events that this writing causes itself are not recorded.
+        self._owner = 0
+        self._io: Any = None
+        self._io_on = os.environ.get("ORMAOS_IO", "1") != "0"
         self._user_files: dict[str, bool] = {}
         self._threads: dict[int, _ThreadState] = {}
         self._suspended: dict[int, _Entry] = {}
@@ -283,6 +290,11 @@ class Recorder:
             # path scope, and for one code object for the few lines after an
             # exception enters a `try` with several clauses.
             _mon.register_callback(tool, _EV.LINE, self._line)
+            if self._io_on:
+                from ormaos._iorec import IoRecorder
+
+                self._io = IoRecorder(self)
+                mask |= self._io.start(tool)
             self._install_fault()
             _mon.set_events(tool, mask)
         except Exception as err:
@@ -295,6 +307,8 @@ class Recorder:
             setattr(self, "_args", _injected_fault)  # noqa: B010
         elif fault == "exceptions":
             setattr(self, "_origin", _injected_fault)  # noqa: B010
+        elif fault == "io" and self._io is not None:
+            setattr(self._io, "_site", _injected_fault)  # noqa: B010
         elif fault == "path":
             setattr(self, "_in_scope", _injected_fault)  # noqa: B010
         elif fault == "write":
@@ -319,6 +333,8 @@ class Recorder:
             return
         self._tool = -1
         _mon.set_events(tool, 0)
+        if self._io is not None:
+            self._io.stop(tool)
         for _flight, code, _lines in list(self._watching.values()):
             _mon.set_local_events(tool, code, 0)
         self._watching = {}
@@ -360,10 +376,15 @@ class Recorder:
         out = ["context", "calls", "exceptions"]
         if self._scopes:
             out.append("path")
+        if self._io_on:
+            out.append("io")
         return out
 
     def _always_not_collected(self) -> list[dict[str, str]]:
+        from ormaos._iorec import NOT_COLLECTED, NOT_COLLECTED_OFF
+
         notes = list(_ALWAYS_NOT_COLLECTED)
+        notes.extend(NOT_COLLECTED if self._io_on else NOT_COLLECTED_OFF)
         if self._scopes:
             notes.append(
                 {
@@ -393,6 +414,9 @@ class Recorder:
             self._watching = {}
             self._ncalls = 0
             self._nlines = 0
+            self._owner = 0
+            if self._io is not None:
+                self._io.reset()
             self._nexc = 0
             self._t0 = time.perf_counter_ns()
             if self._fd >= 0:
@@ -431,6 +455,8 @@ class Recorder:
             pass
 
     def _finish_records(self) -> None:
+        if self._io is not None:
+            self._io.finish()
         for flight in list(self._handled.values()):
             self._finish_handled(flight)
         self._handled = {}
@@ -465,6 +491,7 @@ class Recorder:
             "calls": self._ncalls,
             "exceptions": self._nexc,
             "lines": self._nlines,
+            "io": self._io.count() if self._io is not None else 0,
             "stopped_early": self._dead,
         }
         try:
@@ -489,18 +516,26 @@ class Recorder:
 
     def _emit(self, rec: dict[str, Any]) -> None:
         with self._lock:
-            self._buf.append(rec)
-            if len(self._buf) >= _FLUSH_EVERY:
-                buf = self._buf
-                self._buf = []
-                self._write(buf)
+            self._owner = _thread.get_ident()
+            try:
+                self._buf.append(rec)
+                if len(self._buf) >= _FLUSH_EVERY:
+                    buf = self._buf
+                    self._buf = []
+                    self._write(buf)
+            finally:
+                self._owner = 0
 
     def _flush(self) -> None:
         with self._lock:
-            if self._buf:
-                buf = self._buf
-                self._buf = []
-                self._write(buf)
+            self._owner = _thread.get_ident()
+            try:
+                if self._buf:
+                    buf = self._buf
+                    self._buf = []
+                    self._write(buf)
+            finally:
+                self._owner = 0
 
     def _note(self, what: str, reason: str) -> None:
         self._emit({"k": "not_collected", "what": what, "reason": reason})
@@ -674,7 +709,13 @@ class Recorder:
 
     def _py_start(self, code: CodeType, offset: int) -> object:
         try:
+            io = self._io
+            if io is not None and io.pending:
+                io.install()
             if not self._user(code):
+                if io is not None and code.co_name in _IO_NAMES and io.wants(code):
+                    io.started(code, sys._getframe(1))
+                    return None
                 return _DISABLE
             state = self._thread_state()
             stack = state.stack
@@ -711,7 +752,13 @@ class Recorder:
 
     def _py_return(self, code: CodeType, offset: int, retval: object) -> object:
         try:
+            io = self._io
+            if io is not None and io.pending:
+                io.install()
             if not self._user(code):
+                if io is not None and code in io.watched:
+                    io.returned(code, sys._getframe(1), retval)
+                    return None
                 return _DISABLE
             if self._watching:
                 self._unwatch(id(sys._getframe(1)))
@@ -740,6 +787,8 @@ class Recorder:
                 if self._watching:
                     self._unwatch(id(sys._getframe(1)))
                 self._close(code, "raised", None)
+            elif self._io is not None and code in self._io.watched:
+                self._io.unwound(code, sys._getframe(1))
         except Exception as err:
             self._fail(err)
 

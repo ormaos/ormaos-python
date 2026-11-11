@@ -87,12 +87,15 @@ def run(
     command: Sequence[str],
     json_out: str | None = None,
     path: Sequence[str] = (),
+    io: bool = True,
 ) -> int:
     cwd = os.getcwd()
     env = dict(os.environ)
     env.pop("ORMAOS_DIR", None)
     if path:
         env["ORMAOS_PATH"] = ",".join(path)
+    if not io:
+        env["ORMAOS_IO"] = "0"
     directory: str | None = None
     run_file = ""
     try:
