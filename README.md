@@ -2,7 +2,7 @@
 
 Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent.
 
-> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions, I/O and, inside a scope you ask for, the lines that ran. `ormaos show`, `tree`, `exceptions`, `path` and `io` read a recording.
+> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions, I/O and, inside a scope you ask for, the lines that ran. `ormaos show`, `tree`, `exceptions`, `path` and `io` read a recording. `ormaos guide` tells a coding agent how to use it.
 
 ## What works today
 
@@ -22,7 +22,7 @@ The program runs unchanged, with its own output and exit code. Then, on stderr, 
 ```
 ormaos: r1 exit 0 in 0.03s: 1 Python process, 2 calls, 1 exception (1 swallowed)
 ormaos: swallowed 1x KeyError at <string>:6, raised at <string>:3 [r1:e1]
-ormaos: saved in .ormaos/r1, next: r1:e1 r1:c1
+ormaos: saved in .ormaos/r1, next: ormaos exceptions r1:e1 | ormaos tree r1:c1
 ```
 
 The recording is in `.ormaos/r1/`, as JSON lines (`"format": "provisional-0"`, it will change):
@@ -57,8 +57,11 @@ r1:e1 KeyError: swallowed
 next: ormaos tree r1:c1 | ormaos tree r1:c2 | ormaos path r1:e1
 ```
 
+Start with `ormaos guide`: it explains in about 50 lines when to use Ormaos, where to start, how to follow addresses and what is not recorded. It is written for a coding agent.
+
 - `tree`, `exceptions`, `path` and `io` take a recording, a call or an exception. An exception stands for the call that handled it.
-- Every answer is bounded. `--limit N` asks for more, `--offset N` skips what you have seen; `tree` also takes `--depth N`.
+- Every answer is bounded. `--limit N` asks for more lines, `--offset N` skips entries you have seen (for `tree`: calls directly below the address); `tree` also takes `--depth N`.
+- An exception is `swallowed` (it entered an `except` and was not raised again), `uncaught` (it ended the program), `replaced` (another one was raised from its handler) or `exit` (a `SystemExit`, as `sys.exit()` raises).
 - `--json` on every verb prints one JSON document on stdout, also for errors (`"kind": "error"`). Every document has `"kind"`, `"version"`, `"next"` (addresses) and `"next_commands"`.
 
 ### Line by line: `--path`
@@ -76,13 +79,16 @@ ormaos path r2:e1                                       # the handler of r2:e1, 
 ### I/O: `ormaos io`
 
 ```
-$ ormaos io r1:c9
-r1:c9 sync_orders and the calls below it: 180 io events (sqlite 180)
-  30x sqlite SELECT on_hand FROM stock WHERE sku = ?  at inventory.py:65 in apply_order  [r1:i4]
-  30x sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?  at inventory.py:76 in apply_order  [r1:i7]
-  ...
+$ ormaos io r1:c128
+r1:c128 sync_orders and the calls below it: 180 io events (sqlite 180)
+  30x sqlite SELECT on_hand FROM stock WHERE sku = ?  at inventory.py:65 in apply_order  [r1:i3]
+  30x sqlite SELECT ? FROM applied_orders WHERE order_id = ?  at inventory.py:70 in apply_order  [r1:i4]
+  30x sqlite BEGIN  at inventory.py:76 in apply_order  [r1:i5]
+  30x sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?  at inventory.py:76 in apply_order  [r1:i6]
+  30x sqlite INSERT INTO applied_orders (order_id, sku, quantity, applied_at) VALU...  at inventory.py:80 in apply_order  [r1:i7]
+  30x sqlite COMMIT  at inventory.py:75 in apply_order  [r1:i8]
 calls directly below: 36 check_order (6 raised, no io), 30 apply_order (180 io)
-next: ormaos io r1:i4 | ormaos io r1:i5 | ormaos tree r1:c9 | ormaos io r1:c2
+next: ormaos io r1:i3 | ormaos io r1:i4 | ormaos tree r1:c128 | ormaos io r1:c14
 ```
 
 The I/O is grouped by what was done and by the line of your code that caused it, with a count. `--kind sqlite|file|subprocess|http` shows one kind. `ormaos io r1:i7` shows one event. `ormaos run --no-io` records without I/O.
@@ -103,6 +109,19 @@ How it is observed. Ormaos replaces and wraps nothing: `open` is still `open`, a
 - sqlite3 has no event for statements. So Ormaos sets the trace callback of each connection (`Connection.set_trace_callback`): this is the one place where it sets something on an object of your program. If your program sets its own trace callback, yours replaces it and works as always, and the statements after that are not recorded.
 
 Limits of `io`, also listed in `not_collected` of every recording: a file that is iterated (`for line in f`, `csv.reader(f)`) is read inside C code, so only its `open` is seen; an `open` is recorded when it is asked for, also when it then fails (the exception is recorded too); sockets, other databases, directory operations and `os.read`/`os.write` are not recorded; I/O that no line of your code is waiting for (the import system, library threads) is not recorded. A quoted name in SQL (`"stock"`) is kept only where a name is expected (after `FROM`, `INTO`, `UPDATE`, `JOIN`, ..., or next to a dot); anywhere else it is shown as `?`.
+
+### For coding agents: `ormaos guide`
+
+```bash
+ormaos guide                               # the guide, as text (or --json)
+ormaos guide --agents-md                   # one line to put in the AGENTS.md of your project
+ormaos guide --agents-md --write           # shows the change as a diff, then adds the line to AGENTS.md
+ormaos guide --agents-md --write FILE      # the same, for another file
+```
+
+Without `--write`, no file is touched. With it, the diff is printed first, and a file that already mentions `ormaos guide` is left as it is.
+
+[skills/ormaos/SKILL.md](skills/ormaos/SKILL.md) is the same guidance as a skill, in the `SKILL.md` format (a header with `name` and `description`, then instructions). Copy the folder `skills/ormaos` into the skills folder of your agent.
 
 ### JSON overview
 
