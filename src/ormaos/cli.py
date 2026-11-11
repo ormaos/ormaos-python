@@ -172,7 +172,71 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("sqlite", "file", "subprocess", "http"),
         help="show only this kind of I/O",
     )
+    guide = commands.add_parser(
+        "guide",
+        help="how to use ormaos, for a coding agent (start here)",
+        description=(
+            "Prints a short guide for a coding agent: when to use Ormaos, where "
+            "to start, how to follow addresses, what is not recorded."
+        ),
+    )
+    guide.add_argument("--json", action="store_true", help="print JSON on stdout")
+    guide.add_argument(
+        "--agents-md",
+        action="store_true",
+        help="print one line to add to the AGENTS.md of a project, and nothing else",
+    )
+    guide.add_argument(
+        "--write",
+        nargs="?",
+        const="AGENTS.md",
+        metavar="FILE",
+        help=(
+            "with --agents-md: show the change, then add the line to FILE "
+            "(default AGENTS.md). Without this flag no file is touched."
+        ),
+    )
     return parser
+
+
+def _guide(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    from ormaos.guide import agents_md, guide_document
+    from ormaos.summary import PREFIX
+    from ormaos.verbs import error_document
+
+    if args.write is not None and not args.agents_md:
+        parser.error("--write needs --agents-md")
+    if not args.agents_md:
+        doc = guide_document()
+        print(json.dumps(doc, indent=2) if args.json else doc["text"], end="")
+        if args.json:
+            print()
+        return 0
+    try:
+        doc = agents_md(args.write)
+        content = doc.pop("content", None)
+        if not args.json:
+            # The change is shown first, then made.
+            print(doc["diff"] if args.write is not None else doc["snippet"], end="")
+            if args.write is None:
+                print()
+            sys.stdout.flush()
+        if content is not None:
+            with open(args.write, "w", encoding="utf-8") as handle:
+                handle.write(content)
+    except OSError as err:
+        message = f"cannot change {args.write} ({type(err).__name__})"
+        if args.json:
+            print(json.dumps(error_document(message), indent=2))
+        else:
+            print(PREFIX + message, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(doc, indent=2))
+    elif args.write is not None:
+        done = f"added the line to {args.write}" if doc["changed"] else doc["note"]
+        print(PREFIX + done, file=sys.stderr)
+    return 0
 
 
 def _answer(build: Callable[[], dict[str, Any]], as_json: bool) -> int:
@@ -246,5 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(command, json_out=args.json_out, path=args.path, io=not args.no_io)
     if args.verb in ("show", "tree", "exceptions", "path", "io"):
         return _read(args)
+    if args.verb == "guide":
+        return _guide(args, parser)
     parser.print_help()
     return 0
