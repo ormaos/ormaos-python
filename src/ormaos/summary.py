@@ -21,16 +21,20 @@ def _short_type(name: str) -> str:
     return name.removeprefix("builtins.")
 
 
-def _place(where: dict[str, Any], cwd: str) -> str:
-    file = str(where.get("file", "?"))
+def display_path(file: str, cwd: str) -> str:
+    """The path relative to ``cwd`` when it is inside it, else unchanged."""
     if os.path.isabs(file) and cwd:
         try:
             relative = os.path.relpath(file, cwd)
         except ValueError:
-            relative = file
+            return file
         if not relative.startswith(".."):
-            file = relative
-    return f"{file}:{where.get('line', '?')}"
+            return relative
+    return file
+
+
+def _place(where: dict[str, Any], cwd: str) -> str:
+    return f"{display_path(str(where.get('file', '?')), cwd)}:{where.get('line', '?')}"
 
 
 def _first_line(recording: Recording) -> str:
@@ -61,7 +65,7 @@ def _first_line(recording: Recording) -> str:
     return f"{head}: {', '.join(counts)}{tail}"
 
 
-def _swallowed_groups(exceptions: list[Record]) -> list[list[Record]]:
+def swallowed_groups(exceptions: list[Record]) -> list[list[Record]]:
     groups: dict[tuple[Any, Any, Any], list[Record]] = {}
     for exc in exceptions:
         if exc.get("swallowed"):
@@ -99,7 +103,7 @@ def _uncaught_line(exc: Record, cwd: str) -> str:
 
 def summarize(recording: Recording, cwd: str = "") -> list[str]:
     exceptions = recording.exceptions
-    groups = _swallowed_groups(exceptions)
+    groups = swallowed_groups(exceptions)
     uncaught = [exc for exc in exceptions if exc.get("end") == "uncaught"]
 
     highlights: list[tuple[str, str]] = []  # (line, address)
@@ -123,8 +127,7 @@ def summarize(recording: Recording, cwd: str = "") -> list[str]:
     calls = recording.calls
     if calls:
         following.append(calls[0]["addr"])
-    where = os.path.relpath(recording.path, cwd) if cwd else recording.path
-    last = f"saved in {where}"
+    last = f"saved in {display_path(recording.path, cwd)}"
     if following:
         last += f", next: {' '.join(following)}"
     lines.append(last)

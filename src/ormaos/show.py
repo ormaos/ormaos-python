@@ -28,7 +28,9 @@ def find(ref: str, root: str = ROOT) -> str:
         return os.path.join(root, f"r{numbers[-1]}")
     text = ref.removeprefix("r")
     if not text.isdigit() or int(text) not in numbers:
-        known = f"r{numbers[0]}..r{numbers[-1]}" if len(numbers) > 1 else f"r{numbers[0]}"
+        known = (
+            f"r{numbers[0]}..r{numbers[-1]}" if len(numbers) > 1 else f"r{numbers[0]}"
+        )
         raise NotFound(f"no recording {ref!r} in {root} (there: {known})")
     return os.path.join(root, f"r{int(text)}")
 
@@ -106,7 +108,10 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
     not_collected = [
         {"what": n.get("what"), "reason": n.get("reason")}
         for n in recording.not_collected
-    ] + [{"what": n.get("what"), "reason": n.get("reason"), "always": True} for n in always]
+    ] + [
+        {"what": n.get("what"), "reason": n.get("reason"), "always": True}
+        for n in always
+    ]
 
     following = [group[0]["addr"] for group in groups[:MAX_ADDRESSES]]
     following += [exc["addr"] for exc in uncaught[:MAX_ADDRESSES]]

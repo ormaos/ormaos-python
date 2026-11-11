@@ -62,6 +62,10 @@ class Workdir:
         """Run the command through ``ormaos run --``."""
         return self._run([sys.executable, "-m", "ormaos", "run", "--", *command], env)
 
+    def cli(self, *args: str, env: dict[str, str] | None = None) -> Result:
+        """Run ``ormaos <args>``."""
+        return self._run([sys.executable, "-m", "ormaos", *args], env)
+
     def python(self, *args: str, env: dict[str, str] | None = None) -> Result:
         return self.ormaos(sys.executable, *args, env=env)
 

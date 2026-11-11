@@ -17,6 +17,7 @@ from typing import Any
 
 from ormaos import __version__
 from ormaos.recording import FORMAT, ROOT, load, recording_numbers
+from ormaos.show import document
 from ormaos.summary import PREFIX, summarize
 
 
@@ -82,7 +83,7 @@ def _wait(proc: subprocess.Popen[bytes]) -> int:
             signal.signal(signum, handler)
 
 
-def run(command: Sequence[str]) -> int:
+def run(command: Sequence[str], json_out: str | None = None) -> int:
     cwd = os.getcwd()
     env = dict(os.environ)
     env.pop("ORMAOS_DIR", None)
@@ -154,9 +155,20 @@ def run(command: Sequence[str]) -> int:
             except Exception:
                 pass
             _append(run_file, end)
-            for line in summarize(load(directory), cwd):
+            recording = load(directory)
+            for line in summarize(recording, cwd):
                 print(line, file=sys.stderr)
             sys.stderr.flush()
         except Exception as err:
             _say(f"could not summarize the recording ({type(err).__name__})")
+            recording = None
+        if json_out and recording is not None:
+            try:
+                with open(json_out, "w", encoding="utf-8") as handle:
+                    json.dump(document(recording, cwd), handle, indent=2)
+                    handle.write("\n")
+            except Exception as err:
+                _say(f"could not write {json_out} ({type(err).__name__})")
+    elif json_out:
+        _say(f"{json_out} not written: there is no recording")
     return code
