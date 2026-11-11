@@ -61,6 +61,9 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF"]
 # SIM105: the recorder avoids importing contextlib at interpreter start.
 ignore = ["SIM105"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["ormaos", "conftest"]
+
 [tool.mypy]
 strict = true
 files = ["src"]
