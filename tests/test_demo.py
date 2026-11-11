@@ -232,6 +232,65 @@ def test_following_the_addresses_from_show_reaches_the_swallowing_except(
 
 
 @pytest.mark.parametrize("source", ["csv", "api"])
+def test_io_shows_that_the_orders_with_a_bad_sku_never_reach_the_inventory(
+    demo: Demo, source: str
+) -> None:
+    demo.reset()
+    orders = demo.orders()
+    bad = [o for o in orders if not SKU_FORMAT.fullmatch(o["sku"])]
+    good = len(orders) - len(bad)
+    update_line = demo.line_with("inventory.py", '"UPDATE stock SET') - 1
+    result = demo.recorded("--source", source)
+    assert result.stdout == "sync finished: OK\n"
+
+    # The whole run: where the orders came from, and one UPDATE per good order.
+    whole = demo.ask("io", "last", "--limit", "50")
+    assert whole["by_kind"]["sqlite"] == 1 + 6 * good
+    kinds = {(g["io_kind"], g["op"]) for g in whole["groups"]}
+    assert ("file", "open") in kinds and ("sqlite", "connect") in kinds
+    if source == "api":
+        (request,) = [g for g in whole["groups"] if g["io_kind"] == "http"]
+        assert (request["op"], request["target"], request["status"]) == (
+            "GET",
+            "/orders",
+            200,
+        )
+        assert request["at"]["file"] == "fetch.py" and request["at"]["fn"] == "from_api"
+    (update,) = [g for g in whole["groups"] if g["op"] == "UPDATE"]
+    assert update["sql"] == "UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?"
+    assert update["table"] == "stock" and update["target"] == "data/inventory.db"
+    assert update["count"] == good < len(orders)
+    assert update["at"] == {
+        "file": "inventory.py",
+        "line": update_line,
+        "fn": "apply_order",
+    }
+
+    # From the swallowed exception: the I/O of the call that handled it. Every
+    # order was checked; the ones that raised did no I/O and were not applied.
+    exception = demo.ask("show")["next"][0]
+    handler = demo.ask("io", exception)
+    assert handler["scope"]["fn"] == "sync_orders"
+    assert handler["calls_directly_below"] == [
+        {"fn": "check_order", "calls": len(orders), "raised": len(bad), "io": 0},
+        {"fn": "apply_order", "calls": good, "raised": 0, "io": 6 * good},
+    ]
+    said = demo.say("io", exception)
+    assert said[-2] == (
+        f"calls directly below: {len(orders)} check_order ({len(bad)} raised, no io), "
+        f"{good} apply_order ({6 * good} io)"
+    )
+    assert f"  {good}x sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?" in (
+        "\n".join(said)
+    )
+
+    # One order with a bad SKU: nothing below its check touched the database.
+    left = demo.ask("exceptions", exception)["left_calls"]
+    assert left[-1]["fn"] == "check_order"
+    assert demo.ask("io", left[-1]["address"])["total"] == 0
+
+
+@pytest.mark.parametrize("source", ["csv", "api"])
 def test_the_summary_shows_the_swallowed_sku_exception(demo: Demo, source: str) -> None:
     demo.reset()
     bad = [o for o in demo.orders() if not SKU_FORMAT.fullmatch(o["sku"])]
