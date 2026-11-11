@@ -120,6 +120,13 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
     if calls:
         following.append(calls[0]["addr"])
         commands.append(f"ormaos tree {calls[0]['addr']}")
+    io_by_kind: dict[str, int] = {}
+    for event in recording.io:
+        kind = str(event.get("kind"))
+        io_by_kind[kind] = io_by_kind.get(kind, 0) + int(event.get("n", 1))
+    if io_by_kind:
+        following.append(recording.name)
+        commands.append(f"ormaos io {recording.name}")
 
     return {
         "kind": "show",
@@ -147,7 +154,9 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
             "exceptions": len(exceptions),
             "swallowed": sum(1 for exc in exceptions if exc.get("swallowed")),
             "uncaught": len(uncaught),
+            "io": sum(io_by_kind.values()),
         },
+        "io": io_by_kind,
         "swallowed": [_swallowed(group, cwd) for group in groups[:MAX_GROUPS]],
         "swallowed_groups_not_shown": max(0, len(groups) - MAX_GROUPS),
         "uncaught": [

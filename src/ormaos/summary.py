@@ -62,6 +62,9 @@ def _first_line(recording: Recording) -> str:
         _plural(len(exceptions), "exception"),
     ]
     tail = f" ({swallowed} swallowed)" if exceptions else ""
+    events = sum(int(event.get("n", 1)) for event in recording.io)
+    if events:
+        tail += f", {events} io"
     return f"{head}: {', '.join(counts)}{tail}"
 
 

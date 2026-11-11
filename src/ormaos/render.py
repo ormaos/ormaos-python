@@ -262,6 +262,8 @@ def _show(doc: Doc) -> list[str]:
             f"uncaught {exc['type']} raised at {_place(exc['raised_at'])}  "
             f"[{exc['address']}]"
         )
+    if doc.get("io"):
+        lines.append(f"io: {_plural(counts['io'], 'event')} ({_kinds(doc['io'])})")
     specific = [note for note in doc["not_collected"] if not note.get("always")]
     for note in specific[:5]:
         lines.append(f"not collected: {note['what']}: {note['reason']}")
@@ -270,6 +272,97 @@ def _show(doc: Doc) -> list[str]:
         f"never recorded: values, and {always - 1} more kinds of things "
         "(`ormaos show --json` lists them with the reason)"
     )
+    return lines
+
+
+def _cut(text: str, size: int) -> str:
+    return text if len(text) <= size else text[: size - 3] + "..."
+
+
+def io_label(entry: Doc) -> str:
+    """What one I/O event did, in a few words."""
+    kind, op = entry.get("io_kind"), entry.get("op")
+    if kind == "sqlite":
+        if op == "connect":
+            return f"sqlite connect {entry.get('target')}"
+        return f"sqlite {_cut(str(entry.get('sql')), 72)}"
+    if kind == "file":
+        mode = f" ({entry['mode']})" if entry.get("mode") else ""
+        return f"file {op} {entry.get('target')}{mode}"
+    if kind == "subprocess":
+        return f"subprocess {op} {entry.get('target')}"
+    if kind == "http":
+        port = f":{entry['port']}" if entry.get("port") else ""
+        url = f"{entry.get('scheme')}://{entry.get('host')}{port}{entry.get('target')}"
+        if entry.get("query_string"):
+            url += "?(not recorded)"
+        if entry.get("status") is not None:
+            tail = f" -> {entry['status']}"
+        else:
+            tail = f" -> {entry['out']}" if entry.get("out") else ""
+        return f"http {op} {url}{tail}"
+    return f"{kind} {op}"
+
+
+def _kinds(by_kind: Doc) -> str:
+    return ", ".join(f"{kind} {count}" for kind, count in by_kind.items())
+
+
+def _io(doc: Doc) -> list[str]:
+    where = doc["address"]
+    if doc.get("scope"):
+        where += f" {doc['scope']['fn']} and the calls below it"
+    head = f"{where}: {_plural(doc['total'], 'io event')}"
+    if doc["by_kind"]:
+        head += f" ({_kinds(doc['by_kind'])})"
+    if doc.get("kind_filter"):
+        head += f", showing {doc['kind_filter']}"
+    lines = [head]
+    if doc.get("note"):
+        lines.append(f"  ({doc['note']})")
+    for group in doc["groups"]:
+        at = group["at"]
+        lines.append(
+            f"  {group['count']}x {io_label(group)}  at {_place(at)} in {at.get('fn')}"
+            f"  [{group['first']}]"
+        )
+    if doc["not_shown"]:
+        lines.append(
+            f"... {doc['not_shown']} more groups: "
+            f"--offset {doc['offset'] + doc['limit']}"
+        )
+    below = doc.get("calls_directly_below")
+    if below:
+        parts = []
+        for entry in below:
+            notes = []
+            if entry["raised"]:
+                notes.append(f"{entry['raised']} raised")
+            notes.append(f"{entry['io']} io" if entry["io"] else "no io")
+            parts.append(f"{entry['calls']} {entry['fn']} ({', '.join(notes)})")
+        lines.append("calls directly below: " + ", ".join(parts))
+    return lines
+
+
+def _io_event(doc: Doc) -> list[str]:
+    lines = [f"{doc['address']} {io_label(doc)}"]
+    if doc["count"] > 1:
+        lines.append(f"  {doc['count']} times in a row, at the same line")
+    at = doc["at"]
+    line = f"  caused at   {_place(at)} in {at.get('fn')}"
+    if doc.get("call"):
+        line += f"  [{doc['call']['address']}]"
+    lines.append(line)
+    if doc.get("inside"):
+        chain = " > ".join(f"{c['address']} {c['fn']}" for c in doc["inside"])
+        lines.append(f"  inside      {chain}")
+    if doc.get("io_kind") == "sqlite":
+        lines.append(f"  database    {doc.get('target')}")
+        if doc.get("op") != "connect":
+            lines.append("  parameters  not recorded; literals are shown as ?")
+    took = duration_text(doc.get("duration_s"))
+    if took:
+        lines.append(f"  took        {took}")
     return lines
 
 
@@ -284,6 +377,8 @@ _RENDERERS = {
     "exception": _exception,
     "paths": _paths,
     "path": _path,
+    "io": _io,
+    "io_event": _io_event,
     "error": _error,
 }
 

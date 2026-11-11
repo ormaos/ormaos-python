@@ -81,6 +81,14 @@ class Index:
             todo.extend(kid["addr"] for kid in reversed(self.children.get(addr, [])))
         return out
 
+    def io_count(self, addresses: list[str]) -> int:
+        """How many I/O events happened directly in these calls."""
+        return sum(
+            int(event.get("n", 1))
+            for address in addresses
+            for event in self.io_in.get(address, [])
+        )
+
     def ancestors(self, call: Record) -> list[Record]:
         """From the top of the tree down to the parent of ``call``."""
         out: list[Record] = []
@@ -227,7 +235,7 @@ def _node(ix: Index, call: Record, cwd: str, depth: int) -> dict[str, Any]:
         ]
     if "path" in call:
         node["path_steps"] = len(call["path"])
-    events = sum(len(ix.io_in.get(a, [])) for a in ix.subtree(addr))
+    events = ix.io_count(ix.subtree(addr))
     if events:
         node["io"] = events
     return node
@@ -639,7 +647,159 @@ def path(
     return _finish(doc, commands)
 
 
+# --------------------------------------------------------------------- io
+
+IO_KINDS = ("sqlite", "file", "subprocess", "http")
+_IO_FIELDS = (
+    "target",
+    "mode",
+    "db",
+    "table",
+    "sql",
+    "argc",
+    "scheme",
+    "host",
+    "port",
+    "status",
+    "out",
+)
+
+
+def _io_entry(event: Record, cwd: str) -> dict[str, Any]:
+    entry: dict[str, Any] = {"io_kind": event.get("kind"), "op": event.get("op")}
+    for name in _IO_FIELDS:
+        if name in event:
+            entry[name] = event[name]
+    if entry["io_kind"] in ("file", "sqlite") and isinstance(entry.get("target"), str):
+        entry["target"] = display_path(entry["target"], cwd)
+    if event.get("query"):
+        entry["query_string"] = "not recorded"
+    entry["at"] = _where(event, cwd)
+    return entry
+
+
+def _by_kind(events: list[Record]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        kind = str(event.get("kind"))
+        counts[kind] = counts.get(kind, 0) + int(event.get("n", 1))
+    return counts
+
+
+def _io_detail(target: Target, ix: Index, cwd: str) -> dict[str, Any]:
+    event = target.record
+    doc = _base("io_event", target)
+    doc.update(_io_entry(event, cwd))
+    doc["count"] = int(event.get("n", 1))
+    doc["duration_s"] = _seconds(event.get("dur"))
+    doc["t_s"] = _seconds(event.get("t"))
+    doc["thread"] = event.get("thread")
+    doc["process"] = event.get("process")
+    call = ix.calls.get(event.get("call_addr") or "")
+    doc["call"] = _brief(call, cwd) if call is not None else None
+    doc["inside"] = (
+        [_brief(c, cwd) for c in ix.ancestors(call)[-10:]] if call is not None else []
+    )
+    commands = []
+    if call is not None:
+        commands = [f"ormaos io {call['addr']}", f"ormaos tree {call['addr']}"]
+    commands.append(f"ormaos io {target.recording.name}")
+    return _finish(doc, commands)
+
+
+def io(
+    target: Target,
+    cwd: str = "",
+    limit: int = 20,
+    offset: int = 0,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """The I/O of a recording, or of a call and the calls below it, grouped by
+    what was done and by the line of user code that caused it. Or one event."""
+    ix = Index(target.recording)
+    if target.kind == "io":
+        return _io_detail(target, ix, cwd)
+    name = target.recording.name
+    events = target.recording.io
+    call = _call_of(target, ix)
+    if target.kind != "recording":
+        if call is None:
+            raise Problem(
+                f"{target.address} did not happen inside a recorded call",
+                [f"ormaos io {name}"],
+            )
+        inside = set(ix.subtree(call["addr"]))
+        events = [event for event in events if event.get("call_addr") in inside]
+    by_kind = _by_kind(events)
+    if kind is not None:
+        events = [event for event in events if event.get("kind") == kind]
+    groups: dict[Any, list[Record]] = {}
+    for event in events:
+        key = (
+            *(event.get(field) for field in ("kind", "op", *_IO_FIELDS)),
+            event.get("file"),
+            event.get("line"),
+        )
+        groups.setdefault(key, []).append(event)
+    listed = list(groups.values())
+    page = listed[offset : offset + limit]
+    doc = _base("io", target)
+    doc.update(
+        {
+            "scope": _brief(call, cwd) if call is not None else None,
+            "kind_filter": kind,
+            "total": sum(by_kind.values()),
+            "by_kind": by_kind,
+            "limit": limit,
+            "offset": offset,
+            "groups": [
+                {
+                    **_io_entry(group[0], cwd),
+                    "count": sum(int(event.get("n", 1)) for event in group),
+                    "calls": len({event.get("call_addr") for event in group}),
+                    "first": group[0]["addr"],
+                }
+                for group in page
+            ],
+            "not_shown": max(0, len(listed) - offset - len(page)),
+        }
+    )
+    if call is not None:
+        below: dict[str, dict[str, Any]] = {}
+        for kid in ix.children.get(call["addr"], []):
+            entry = below.setdefault(
+                str(kid.get("fn")),
+                {"fn": kid.get("fn"), "calls": 0, "raised": 0, "io": 0},
+            )
+            entry["calls"] += 1
+            entry["raised"] += kid.get("out") == "raised"
+            entry["io"] += ix.io_count(ix.subtree(kid["addr"]))
+        doc["calls_directly_below"] = list(below.values())[:8]
+        doc["io_in_the_call_itself"] = ix.io_count([call["addr"]])
+    if not target.recording.processes or not any(
+        "io" in proc.header.get("capabilities", [])
+        for proc in target.recording.processes
+    ):
+        doc["note"] = "I/O was not recorded in this recording"
+    commands = [f"ormaos io {group['first']}" for group in doc["groups"][:2]]
+    if doc["not_shown"]:
+        more = f"ormaos io {target.address} --offset {offset + len(page)}"
+        commands.append(more + (f" --kind {kind}" if kind else ""))
+    if call is not None:
+        commands.append(f"ormaos tree {call['addr']}")
+        if call.get("parent_addr"):
+            commands.append(f"ormaos io {call['parent_addr']}")
+    else:
+        callers = list(
+            dict.fromkeys(e.get("call_addr") for e in events if e.get("call_addr"))
+        )
+        commands.extend(f"ormaos io {address}" for address in callers[:1])
+        commands.append(f"ormaos exceptions {name}")
+    return _finish(doc, commands)
+
+
 __all__ = [
+    "IO_KINDS",
     "VERSION",
     "Index",
     "NotFound",
@@ -647,6 +807,7 @@ __all__ = [
     "Target",
     "error_document",
     "exceptions",
+    "io",
     "path",
     "resolve",
     "tree",

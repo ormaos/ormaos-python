@@ -11,7 +11,7 @@ from ormaos import __version__
 
 _ADDRESS_HELP = (
     "`last` (the default), a recording such as r3, or an address inside one: "
-    "r3:c42 (a call), r3:e5 (an exception)"
+    "r3:c42 (a call), r3:e5 (an exception), r3:i7 (an io event)"
 )
 
 
@@ -87,7 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser(
         "run",
         help="run a command and record the Python processes it starts",
-        usage="ormaos run [--path SCOPE] [--json-out FILE] -- <command> [args...]",
+        usage=(
+            "ormaos run [--path SCOPE] [--no-io] [--json-out FILE] "
+            "-- <command> [args...]"
+        ),
         description=(
             "Runs the command unchanged, records the Python processes it "
             "starts into .ormaos/, prints a summary of at most 5 lines on "
@@ -103,6 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
             "also record line by line inside SCOPE: file.py, file.py:function "
             "or function (can be given more than once)"
         ),
+    )
+    run.add_argument(
+        "--no-io",
+        action="store_true",
+        help="do not record I/O (database, files, subprocesses, HTTP)",
     )
     run.add_argument(
         "--json-out",
@@ -149,6 +157,20 @@ def build_parser() -> argparse.ArgumentParser:
         "exceptions it handled in between. Lines exist only for calls inside "
         "the scope given to `ormaos run --path`.",
         40,
+    )
+    io = _reader(
+        commands,
+        "io",
+        "show the I/O of an address: database, files, subprocesses, HTTP",
+        "For a recording or a call: what I/O it did, grouped by what was done "
+        "and by the line of your code that caused it. For one io event: where "
+        "it happened. Statements, paths and URLs are shown without values.",
+        20,
+    )
+    io.add_argument(
+        "--kind",
+        choices=("sqlite", "file", "subprocess", "http"),
+        help="show only this kind of I/O",
     )
     return parser
 
@@ -202,6 +224,8 @@ def _read(args: argparse.Namespace) -> int:
             return verbs.tree(target, cwd, args.limit, args.depth, args.offset or 0)
         if args.verb == "exceptions":
             return verbs.exceptions(target, cwd, args.limit, args.offset or 0)
+        if args.verb == "io":
+            return verbs.io(target, cwd, args.limit, args.offset or 0, args.kind)
         return verbs.path(target, cwd, args.limit, args.offset)
 
     return _answer(build, args.json)
@@ -219,8 +243,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("run needs a command: ormaos run -- <command> [args...]")
         from ormaos.runner import run
 
-        return run(command, json_out=args.json_out, path=args.path)
-    if args.verb in ("show", "tree", "exceptions", "path"):
+        return run(command, json_out=args.json_out, path=args.path, io=not args.no_io)
+    if args.verb in ("show", "tree", "exceptions", "path", "io"):
         return _read(args)
     parser.print_help()
     return 0
