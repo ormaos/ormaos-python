@@ -40,6 +40,13 @@ path = "src/ormaos/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ormaos"]
 
+# The .pth file starts the recorder in Python processes that have ORMAOS_DIR set.
+[tool.hatch.build.targets.wheel.force-include]
+"ormaos.pth" = "ormaos.pth"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "ormaos.pth", "README.md", "LICENSE"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
@@ -51,6 +58,8 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF"]
+# SIM105: the recorder avoids importing contextlib at interpreter start.
+ignore = ["SIM105"]
 
 [tool.mypy]
 strict = true

@@ -1,0 +1,1 @@
+import os; exec("try:\n    import ormaos._autostart\nexcept Exception:\n    pass") if os.environ.get("ORMAOS_DIR") else None
