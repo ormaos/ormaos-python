@@ -217,6 +217,99 @@ def test_the_program_behaves_the_same_with_io_recording(work: Workdir) -> None:
     assert ops == ["connect", "open", "read"]
 
 
+def test_the_program_sets_its_own_trace_callback_later(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    # Ours is set first; then the program sets its own, and later clears it.
+    # The program's choice stays, and the recording says where capture stopped.
+    source = (
+        "import sqlite3\n"
+        "seen = []\n"
+        "conn = sqlite3.connect(':memory:', isolation_level=None)\n"
+        "conn.execute('create table t (a)')\n"
+        "conn.set_trace_callback(seen.append)  # sets\n"
+        "conn.execute('insert into t values (1)')\n"
+        "conn.set_trace_callback(None)\n"
+        "conn.execute('insert into t values (2)')\n"
+        "other = sqlite3.connect(':memory:', isolation_level=None)\n"
+        "other.execute('create table u (b)')\n"
+        "sqlite3.Connection.set_trace_callback(other, None)  # clears\n"
+        "other.execute('insert into u values (3)')\n"
+        "print(seen, conn.execute('select count(*) from t').fetchone())\n"
+    )
+    work.write("program.py", source)
+    plain = work.plain(sys.executable, "program.py")
+    result = work.python("program.py")
+    assert plain.stdout == "['insert into t values (1)'] (2,)\n"
+    assert (result.returncode, result.stdout) == (0, plain.stdout)
+    assert result.program_stderr == plain.stderr
+    statements = [
+        e["sql"] for e in work.last().io if e["kind"] == "sqlite" and "sql" in e
+    ]
+    assert statements == ["create table t (a)", "create table u (b)"]
+    notes = {n["what"]: n["reason"] for n in work.last().not_collected}
+    assert len(notes) == 2
+    for db, mark in ((1, "sets"), (2, "clears")):
+        reason = notes[
+            f"io: the statements of sqlite3 connection {db} after this point"
+        ]
+        assert f"(at program.py:{line_of(source, mark)})" in reason
+        assert "its choice was left in place" in reason
+
+
+def test_a_trace_callback_the_program_had_already_set_is_kept(work: Workdir) -> None:
+    # In the second turn of the loop no call site reports to Ormaos any more,
+    # so the program sets its callback before Ormaos sets its own. Both run:
+    # the program's gets every statement, in order, and Ormaos records them.
+    source = (
+        "import functools, operator, sqlite3, sys\n"
+        "sqlite3.enable_callback_tracebacks(True)\n"
+        "seen = []\n"
+        "def callback(statement):\n"
+        "    seen.append(statement)\n"
+        "    if 'boom' in statement:\n"
+        "        raise ValueError('from the callback')\n"
+        "class Loud:\n"
+        "    def __call__(self, statement):\n"
+        "        callback(statement)\n"
+        "    def __repr__(self):\n"
+        "        return 'Loud()'\n"
+        "make = functools.partial(sqlite3.connect, ':memory:')\n"
+        "set_it = operator.methodcaller('set_trace_callback', Loud())\n"
+        "conns = []\n"
+        "for _ in range(2):\n"
+        "    conn = make()\n"
+        "    set_it(conn)\n"
+        "    conns.append(conn)\n"
+        "conn = conns[1]\n"
+        "conn.execute('create table t (a)')\n"
+        "conn.executemany('insert into t values (?)', [(1,), (2,)])\n"
+        "conn.execute(\"select 'boom'\")\n"
+        "print(seen)\n"
+        "print(conn.execute('select a from t').fetchall())\n"
+    )
+    work.write("program.py", source)
+    plain = work.plain(sys.executable, "program.py")
+    result = work.python("program.py")
+    assert "ValueError: from the callback" in plain.stderr
+    assert "insert into t values (2)" in plain.stdout
+    assert (result.returncode, result.stdout) == (0, plain.stdout)
+    assert result.program_stderr == plain.stderr
+    statements = [
+        (e["sql"], e.get("n"))
+        for e in work.last().io
+        if e.get("db") == 2 and "sql" in e
+    ]
+    assert statements == [
+        ("create table t (a)", 1),
+        ("BEGIN", 1),
+        ("insert into t values (?)", 2),
+        ("select ?", 1),
+        ("select a from t", 1),
+    ]
+    assert work.last().not_collected == []
+
+
 def test_a_connection_is_not_kept_when_its_thread_goes_quiet(work: Workdir) -> None:
     # Threads that run no Python code of their own after connecting: the
     # second one reports nothing to Ormaos, so its connection is given up.
@@ -260,7 +353,7 @@ def test_what_io_does_not_record_is_listed(work: Workdir) -> None:
     assert "set_trace_callback" not in notes["io: contents"]
     assert (
         "sets the trace callback"
-        in (notes["io: sqlite3 statements, if the program sets a trace callback"])
+        in (notes["io: sqlite3 statements, after the program sets a trace callback"])
     )
     assert (
         "csv.reader"

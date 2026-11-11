@@ -13,8 +13,10 @@ How each thing is seen (nothing is replaced or wrapped):
   never imported here: their code is recognised when the program runs it.
 - sqlite3 statements: there is no event for them, so the trace callback of each
   connection is set (``Connection.set_trace_callback``). This is the one place
-  where Ormaos sets something on an object of the program. A program that
-  sets its own trace callback replaces ours.
+  where Ormaos sets something on an object of the program. A callback the
+  program had set before is kept and called after ours. When the program sets
+  or clears the callback later, its choice stays, and the recording says that
+  the statements of that connection stopped there.
 
 Shape always, value never: a file is named by its path, a statement by its
 text with every literal replaced by ``?``, a request by method, host and path
@@ -23,10 +25,12 @@ without the query string. No parameters, no contents, no headers, no bodies.
 
 import _io
 import _thread
+import gc
 import itertools
 import os
 import sys
 import time
+from _weakref import ref as _ref
 from types import CodeType, FrameType
 from typing import Any
 
@@ -44,9 +48,11 @@ _FILE = _io.FileIO
 
 _READS = frozenset({"read", "readline", "readlines", "readinto", "read1", "readall"})
 _WRITES = frozenset({"write", "writelines"})
+_SET_TRACE = "set_trace_callback"
 # Call sites of these names stay on. `connect`, so that the trace callback of
-# a new sqlite3 connection is set as soon as `sqlite3.connect` returns.
-_WATCHED = _READS | _WRITES | {"connect"}
+# a new sqlite3 connection is set as soon as `sqlite3.connect` returns;
+# `set_trace_callback`, to see the program set its own.
+_WATCHED = _READS | _WRITES | {"connect", _SET_TRACE}
 
 _HTTP_CLIENT = os.sep + os.path.join("http", "client.py")
 _HTTPX = os.sep + os.path.join("httpx", "_client.py")
@@ -55,6 +61,7 @@ _SUBPROCESS = os.sep + "subprocess.py"
 _GIVE_UP_NS = 1_000_000_000
 _MAX_TEXT = 200
 _MAX_WAITING = 1000
+_MAX_TRACE_NOTES = 20
 _FRAMES = 300
 
 _get_dict = object.__getattribute__
@@ -78,10 +85,14 @@ NOT_COLLECTED = [
         "happens inside C code, and only the `open` is seen",
     },
     {
-        "what": "io: sqlite3 statements, if the program sets a trace callback",
+        "what": "io: sqlite3 statements, after the program sets a trace callback",
         "reason": "sqlite3 has no event for statements, so Ormaos sets the trace "
-        "callback of each connection; a program that sets its own replaces it, "
-        "and the statements after that are not recorded",
+        "callback of each connection. A callback the program had already set "
+        "is kept and still called. When the program sets or clears the "
+        "callback later, its choice stays and the statements after that are "
+        "not recorded: this is reported for the connection when the call is "
+        "made by Python code, and not when it is made from inside C code "
+        "(`operator.methodcaller`, an extension module)",
     },
     {
         "what": "io: other kinds",
@@ -275,6 +286,53 @@ def _program(value: object) -> str:
     return os.path.basename(text) if text else "?"
 
 
+class _Tracer:
+    """The trace callback that Ormaos sets on one sqlite3 connection.
+
+    ``prev`` is the callback the program had set before, if any: it is called
+    after ours with the same statement, and what it raises leaves as if it
+    had been called directly (our frame is taken out of the traceback, and
+    ``repr`` is the one of the program's callback, because sqlite3 prints it
+    when a callback raises)."""
+
+    __slots__ = ("__weakref__", "_db", "_io", "_target", "prev")
+
+    def __init__(self, io: "IoRecorder", db: int, target: str) -> None:
+        self._io = io
+        self._db = db
+        self._target = target
+        self.prev: Any = None
+
+    def __call__(self, statement: object) -> None:
+        io = self._io
+        if io._on:
+            try:
+                if type(statement) is str and io._rec._owner != _thread.get_ident():
+                    verb, table, text = sql_shape(statement)
+                    fields = {
+                        "target": self._target,
+                        "db": self._db,
+                        "table": table,
+                        "sql": text,
+                    }
+                    io._new("sqlite", verb, sys._getframe(1), fields)
+            except Exception as err:
+                io._rec._fail(err)
+        prev = self.prev
+        if prev is not None:
+            try:
+                prev(statement)
+            except BaseException as err:
+                tb = err.__traceback__
+                if tb is not None:
+                    err.__traceback__ = tb.tb_next
+                raise
+
+    def __repr__(self) -> str:
+        prev = self.prev
+        return object.__repr__(self) if prev is None else repr(prev)
+
+
 class IoRecorder:
     def __init__(self, recorder: Any) -> None:
         self._rec = recorder
@@ -290,6 +348,14 @@ class IoRecorder:
         self.pending: dict[int, list[tuple[Any, int, str, int]]] = {}
         self._db_target: dict[int, str] = {}
         self._dbs = 0
+        # id(connection) -> its number and our callback (not kept alive).
+        self._tracers: dict[int, tuple[int, Any]] = {}
+        self._trace_notes = 0
+        # Can this Python show the trace callback of a connection? None: not
+        # asked yet. `_probing`: the thread that is asking, with a connection
+        # of our own that is not an event of the program.
+        self._sees: bool | None = None
+        self._probing = 0
         # Requests waiting for their response: id(connection or frame) -> record.
         self._waiting: dict[int, dict[str, Any]] = {}
         # Library code whose start and return we look at: code -> which one.
@@ -423,7 +489,8 @@ class IoRecorder:
         if handler is None:
             return
         try:
-            if self._rec._owner == _thread.get_ident():
+            ident = _thread.get_ident()
+            if self._rec._owner == ident or self._probing == ident:
                 return  # this thread is in the middle of writing the recording
             try:
                 frame = sys._getframe(1)
@@ -481,6 +548,16 @@ class IoRecorder:
         try:
             if self.pending:
                 self.install()
+            if self._tracers:
+                tp = type(func)
+                if tp is _METHOD:
+                    target = arg0
+                elif tp is _BUILTIN:
+                    target = func.__self__  # type: ignore[attr-defined]
+                else:
+                    return
+                if func.__name__ == _SET_TRACE:  # type: ignore[attr-defined]
+                    self._program_set(target, code)
         except Exception as err:
             self._rec._fail(err)
 
@@ -493,6 +570,7 @@ class IoRecorder:
         ident = _thread.get_ident()
         target = self._db_target.pop(ident, "?")
         self._dbs += 1
+        self._tracers.pop(id(args[0]), None)  # an address used again
         # The connection is not ready inside the audit event: its trace
         # callback is set at our next callback in this thread.
         entry = (args[0], self._dbs, target, time.perf_counter_ns())
@@ -503,13 +581,7 @@ class IoRecorder:
         """Set the trace callback of the connections this thread just made."""
         todo = self.pending.pop(_thread.get_ident(), None)
         for conn, db, target, _made in todo or ():
-            try:
-                conn.set_trace_callback(self._tracer(db, target))
-            except Exception as err:
-                self._rec._note(
-                    f"io: the statements of sqlite3 connection {db}",
-                    f"its trace callback could not be set ({type(err).__name__})",
-                )
+            self._set_tracer(conn, db, target)
         if self.pending:
             # A connection is only held until its own thread comes back here.
             # A thread that does not come back within a second gives it up, so
@@ -524,19 +596,83 @@ class IoRecorder:
                             "code of its own for a second after making it",
                         )
 
-    def _tracer(self, db: int, target: str) -> Any:
-        def trace(statement: object) -> None:
-            if not self._on:
-                return
+    def _sees_callbacks(self) -> bool:
+        """Does a connection show its trace callback to ``gc.get_referents``?
+        Asked once, on a connection of our own in memory. Without it we could
+        not know whether the program had already set one."""
+        if self._sees is None:
+            self._sees = False
+            self._probing = _thread.get_ident()
             try:
-                if type(statement) is str and self._rec._owner != _thread.get_ident():
-                    verb, table, text = sql_shape(statement)
-                    fields = {"target": target, "db": db, "table": table, "sql": text}
-                    self._new("sqlite", verb, sys._getframe(1), fields)
-            except Exception as err:
-                self._rec._fail(err)
+                probe = sys.modules["_sqlite3"].Connection(":memory:")
+                try:
+                    mark = _Tracer(self, 0, "")
+                    probe.set_trace_callback(mark)
+                    self._sees = any(x is mark for x in gc.get_referents(probe))
+                finally:
+                    probe.close()
+            except Exception:
+                pass
+            finally:
+                self._probing = 0
+        return self._sees
 
-        return trace
+    def _set_tracer(self, conn: Any, db: int, target: str) -> None:
+        what = f"io: the statements of sqlite3 connection {db}"
+        if not self._sees_callbacks():
+            self._rec._note(
+                what,
+                "this Python does not show whether a connection already has a "
+                "trace callback, so Ormaos set none",
+            )
+            return
+        tracer = _Tracer(self, db, target)
+        try:
+            before = gc.get_referents(conn)
+            conn.set_trace_callback(tracer)
+            after = gc.get_referents(conn)
+        except Exception as err:
+            self._rec._note(
+                what, f"its trace callback could not be set ({type(err).__name__})"
+            )
+            return
+        # What the connection no longer refers to is the callback the program
+        # had set before ours: keep it, and call it after ours.
+        left = [id(item) for item in after]
+        for item in before:
+            try:
+                left.remove(id(item))
+            except ValueError:
+                tracer.prev = item
+        self._tracers[id(conn)] = (db, _ref(tracer))
+
+    def _program_set(self, conn: object, code: CodeType) -> None:
+        """A call of `set_trace_callback` returned. If our callback is gone
+        from that connection, the program set or cleared it: say so."""
+        entry = self._tracers.get(id(conn))
+        if entry is None or code.co_filename == __file__:
+            return
+        db, alive = entry
+        tracer = alive()
+        if tracer is not None and any(x is tracer for x in gc.get_referents(conn)):
+            return
+        del self._tracers[id(conn)]
+        self._trace_notes += 1
+        if self._trace_notes > _MAX_TRACE_NOTES:
+            if self._trace_notes == _MAX_TRACE_NOTES + 1:
+                self._rec._note(
+                    "io: the statements of more sqlite3 connections",
+                    "the program set or cleared their trace callback too; only "
+                    f"the first {_MAX_TRACE_NOTES} connections are listed",
+                )
+            return
+        name = os.path.basename(code.co_filename)
+        self._rec._note(
+            f"io: the statements of sqlite3 connection {db} after this point",
+            "the program set or cleared the trace callback of this connection "
+            f"(at {name}:{sys._getframe(2).f_lineno}); its choice was left in "
+            "place, and the statements after that were not recorded",
+        )
 
     # ---------------------------------------------------------- subprocesses
 
