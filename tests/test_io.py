@@ -217,6 +217,31 @@ def test_the_program_behaves_the_same_with_io_recording(work: Workdir) -> None:
     assert ops == ["connect", "open", "read"]
 
 
+def test_a_connection_is_not_kept_when_its_thread_goes_quiet(work: Workdir) -> None:
+    # Threads that run no Python code of their own after connecting: the
+    # second one reports nothing to Ormaos, so its connection is given up.
+    source = (
+        "import functools, sqlite3, threading, time\n"
+        "make = functools.partial(sqlite3.connect, ':memory:')\n"
+        "for _ in range(3):\n"
+        "    thread = threading.Thread(target=make)\n"
+        "    thread.start()\n"
+        "    thread.join()\n"
+        "time.sleep(1.1)\n"
+        "print('ok')\n"
+    )
+    work.write("program.py", source)
+    plain = work.plain(sys.executable, "program.py")
+    result = work.python("program.py")
+    assert (result.returncode, result.stdout) == (0, "ok\n")
+    assert result.program_stderr == plain.stderr
+    notes = work.last().not_collected
+    assert any(
+        "ran no Python code of its own for a second" in n["reason"] for n in notes
+    )
+    assert all(n["what"].startswith("io: the statements of sqlite3") for n in notes)
+
+
 def test_io_can_be_turned_off(work: Workdir) -> None:
     recorded(work, PROGRAM, "--no-io", PLANTED="x")
     doc = ask(work, "io", "r1")

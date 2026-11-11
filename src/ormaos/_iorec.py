@@ -52,6 +52,7 @@ _HTTP_CLIENT = os.sep + os.path.join("http", "client.py")
 _HTTPX = os.sep + os.path.join("httpx", "_client.py")
 _SUBPROCESS = os.sep + "subprocess.py"
 
+_GIVE_UP_NS = 1_000_000_000
 _MAX_TEXT = 200
 _MAX_WAITING = 1000
 _FRAMES = 300
@@ -286,7 +287,7 @@ class IoRecorder:
         # Per thread: the last event, kept so that a repeat only adds to `n`.
         self._held: dict[int, tuple[Any, dict[str, Any]]] = {}
         # Per thread: sqlite3 connections whose trace callback is not set yet.
-        self.pending: dict[int, list[tuple[Any, int, str]]] = {}
+        self.pending: dict[int, list[tuple[Any, int, str, int]]] = {}
         self._db_target: dict[int, str] = {}
         self._dbs = 0
         # Requests waiting for their response: id(connection or frame) -> record.
@@ -494,13 +495,14 @@ class IoRecorder:
         self._dbs += 1
         # The connection is not ready inside the audit event: its trace
         # callback is set at our next callback in this thread.
-        self.pending.setdefault(ident, []).append((args[0], self._dbs, target))
+        entry = (args[0], self._dbs, target, time.perf_counter_ns())
+        self.pending.setdefault(ident, []).append(entry)
         self._new("sqlite", "connect", frame, {"target": target, "db": self._dbs})
 
     def install(self) -> None:
         """Set the trace callback of the connections this thread just made."""
         todo = self.pending.pop(_thread.get_ident(), None)
-        for conn, db, target in todo or ():
+        for conn, db, target, _made in todo or ():
             try:
                 conn.set_trace_callback(self._tracer(db, target))
             except Exception as err:
@@ -508,6 +510,19 @@ class IoRecorder:
                     f"io: the statements of sqlite3 connection {db}",
                     f"its trace callback could not be set ({type(err).__name__})",
                 )
+        if self.pending:
+            # A connection is only held until its own thread comes back here.
+            # A thread that does not come back within a second gives it up, so
+            # that Ormaos never keeps a connection of the program alive.
+            now = time.perf_counter_ns()
+            for ident, waiting in list(self.pending.items()):
+                if waiting and now - waiting[0][3] > _GIVE_UP_NS:
+                    for _conn, db, _target, _made in self.pending.pop(ident, ()):
+                        self._rec._note(
+                            f"io: the statements of sqlite3 connection {db}",
+                            "the thread that made the connection ran no Python "
+                            "code of its own for a second after making it",
+                        )
 
     def _tracer(self, db: int, target: str) -> Any:
         def trace(statement: object) -> None:
