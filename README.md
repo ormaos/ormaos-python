@@ -2,7 +2,7 @@
 
 Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent.
 
-> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions and, inside a scope you ask for, the lines that ran. `ormaos show`, `tree`, `exceptions` and `path` read a recording.
+> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions, I/O and, inside a scope you ask for, the lines that ran. `ormaos show`, `tree`, `exceptions`, `path` and `io` read a recording.
 
 ## What works today
 
@@ -30,12 +30,13 @@ The recording is in `.ormaos/r1/`, as JSON lines (`"format": "provisional-0"`, i
 - `context`: the command, the names of the environment variables (never the values), duration, CPU, memory, threads, and one file per Python process.
 - `calls`: the call tree of your code, with the shape of the arguments and of the return value.
 - `exceptions`: every exception that passes through your code, where it was raised and where it was handled, marked `swallowed` when it was handled and not raised again.
+- `io`: sqlite3 statements, files opened, read and written, subprocesses started and HTTP requests, each with the line of your code that caused it (see below).
 - `path`: line by line, only inside a scope you ask for with `--path` (see below).
 - `not_collected`: everything that was not recorded, with the reason.
 
 ## Reading a recording
 
-Everything in a recording has a short address: `r1` is the recording, `r1:c7` a call, `r1:e1` an exception. Each answer is short and ends with a `next:` line: the commands for the next question.
+Everything in a recording has a short address: `r1` is the recording, `r1:c7` a call, `r1:e1` an exception, `r1:i3` an I/O event. Each answer is short and ends with a `next:` line: the commands for the next question.
 
 ```bash
 ormaos show                # the overview of the last recording (or: ormaos show r1)
@@ -43,6 +44,7 @@ ormaos exceptions r1       # its exceptions, swallowed first
 ormaos exceptions r1:e1    # one exception: where raised, the calls it left, where handled
 ormaos tree r1:c7          # the calls below a call: shapes, results, durations
 ormaos path r1:c7          # the lines that call ran, in order
+ormaos io r1:c7            # the I/O of that call and of the calls below it
 ```
 
 ```
@@ -55,7 +57,7 @@ r1:e1 KeyError: swallowed
 next: ormaos tree r1:c1 | ormaos tree r1:c2 | ormaos path r1:e1
 ```
 
-- `tree`, `exceptions` and `path` take a recording, a call or an exception. An exception stands for the call that handled it.
+- `tree`, `exceptions`, `path` and `io` take a recording, a call or an exception. An exception stands for the call that handled it.
 - Every answer is bounded. `--limit N` asks for more, `--offset N` skips what you have seen; `tree` also takes `--depth N`.
 - `--json` on every verb prints one JSON document on stdout, also for errors (`"kind": "error"`). Every document has `"kind"`, `"version"`, `"next"` (addresses) and `"next_commands"`.
 
@@ -71,6 +73,37 @@ ormaos path r2:e1                                       # the handler of r2:e1, 
 
 `path` shows the lines in the order they ran, with the calls made and the exceptions caught in between. The text of each line is read from your file when you ask, it is not in the recording.
 
+### I/O: `ormaos io`
+
+```
+$ ormaos io r1:c9
+r1:c9 sync_orders and the calls below it: 180 io events (sqlite 180)
+  30x sqlite SELECT on_hand FROM stock WHERE sku = ?  at inventory.py:65 in apply_order  [r1:i4]
+  30x sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?  at inventory.py:76 in apply_order  [r1:i7]
+  ...
+calls directly below: 36 check_order (6 raised, no io), 30 apply_order (180 io)
+next: ormaos io r1:i4 | ormaos io r1:i5 | ormaos tree r1:c9 | ormaos io r1:c2
+```
+
+The I/O is grouped by what was done and by the line of your code that caused it, with a count. `--kind sqlite|file|subprocess|http` shows one kind. `ormaos io r1:i7` shows one event. `ormaos run --no-io` records without I/O.
+
+What is written for each kind, and what is not:
+
+| Kind | Recorded | Never recorded |
+|---|---|---|
+| `sqlite` | the connection (the path of the database), each statement with every literal replaced by `?`, the table | parameters, literals, rows |
+| `file` | `open` with the path and the mode; `read` and `write` when Python code calls them on the file | contents, sizes |
+| `subprocess` | the name of the program started (`subprocess`, `os.system`, `os.exec*`, `os.posix_spawn`, `os.fork`) and how many arguments | arguments, environment, output, exit status |
+| `http` | method, scheme, host, port, path, status and duration, for `http.client` (so also `urllib`, `requests`, `urllib3`) and for `httpx` | query string, headers, bodies |
+
+How it is observed. Ormaos replaces and wraps nothing: `open` is still `open`, a connection is still a `sqlite3.Connection`.
+
+- Files, subprocesses, `sqlite3.connect` and the request line of `http.client` are seen through Python's audit events (`sys.addaudithook`). An audit hook cannot be removed; when recording stops it stays and does nothing.
+- `read` and `write` on a file, and the status of an HTTP response, are seen through `sys.monitoring`. `requests` and `httpx` are never imported by Ormaos: their code is recognised when your program runs it.
+- sqlite3 has no event for statements. So Ormaos sets the trace callback of each connection (`Connection.set_trace_callback`): this is the one place where it sets something on an object of your program. If your program sets its own trace callback, yours replaces it and works as always, and the statements after that are not recorded.
+
+Limits of `io`, also listed in `not_collected` of every recording: a file that is iterated (`for line in f`, `csv.reader(f)`) is read inside C code, so only its `open` is seen; an `open` is recorded when it is asked for, also when it then fails (the exception is recorded too); sockets, other databases, directory operations and `os.read`/`os.write` are not recorded; I/O that no line of your code is waiting for (the import system, library threads) is not recorded. A quoted name in SQL (`"stock"`) is kept only where a name is expected (after `FROM`, `INTO`, `UPDATE`, `JOIN`, ..., or next to a dot); anywhere else it is shown as `?`.
+
 ### JSON overview
 
 ```bash
@@ -78,9 +111,9 @@ ormaos run --json-out overview.json -- python job.py   # written next to the run
 ormaos show --json last                                # or r1, r2, ...
 ```
 
-The JSON goes to the file or to stdout, never mixed with the program's output. It has the context, the counts, the swallowed exceptions grouped by handler (with where they were raised and how many times), the uncaught ones, `not_collected`, and `next`: the addresses to ask about next.
+The JSON goes to the file or to stdout, never mixed with the program's output. It has the context, the counts, the swallowed exceptions grouped by handler (with where they were raised and how many times), the uncaught ones, the I/O counted by kind, `not_collected`, and `next`: the addresses to ask about next.
 
-Shape always, value never: Ormaos records types, lengths and structure (`{"type": "str", "len": 14}`), never the content of an argument, an environment variable or an exception message.
+Shape always, value never: Ormaos records types, lengths and structure (`{"type": "str", "len": 14}`), never the content of an argument, an environment variable or an exception message. For I/O it records names (a path, a table, a host, a program) and never contents.
 
 ## Limits today
 
@@ -89,7 +122,7 @@ Shape always, value never: Ormaos records types, lengths and structure (`{"type"
 - The handler line is the `except` clause that matched. Two rare cases may show an earlier clause of the same `try`: `except*`, and a clause whose types span several lines.
 - Recording costs time on every call, and the files are large for long runs. At most 200,000 calls, 50,000 exceptions and 200,000 lines are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`, `ORMAOS_MAX_LINES`); the rest is listed in `not_collected`. The cost is not measured yet.
 - `path` has the lines of the functions inside the scope, not of the functions they call (those appear as calls).
-- Database, file, subprocess and HTTP activity is not recorded yet.
+- At most 100,000 I/O events are kept per process (`ORMAOS_MAX_IO`). The same event repeated at the same line is one event with a count.
 - A process that is killed, or that ends with `os._exit`, loses its last events. The recording says so.
 - Tested on Linux only.
 
