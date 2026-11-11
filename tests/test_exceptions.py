@@ -136,7 +136,10 @@ def test_summary_shows_the_swallowed_exception(
         f"raised at exc.py:{line_of(SOURCE, 'raise')} [r1:e1]"
     )
     assert summary[2].startswith("ormaos: uncaught ZeroDivisionError raised at exc.py:")
-    assert summary[-1] == "ormaos: saved in .ormaos/r1, next: r1:e1 r1:e14 r1:c1"
+    assert summary[-1] == (
+        "ormaos: saved in .ormaos/r1, next: ormaos exceptions r1:e1 | "
+        "ormaos exceptions r1:e14 | ormaos tree r1:c1"
+    )
 
 
 def test_swallowed_exception_in_a_command_string(work: Workdir) -> None:

@@ -122,6 +122,7 @@ def test_tree_of_a_call_shows_shapes_results_and_what_was_handled(
     (rest,) = doc["not_shown"]
     assert rest == {
         "parent": address,
+        "total": 12,
         "not_shown": 9,
         "by_fn": {"step": 9},
         "raised": 3,
@@ -139,7 +140,10 @@ def test_tree_of_a_call_shows_shapes_results_and_what_was_handled(
         f"{address} work(items: list[12 int]) -> int  code.py:14"
     )
     assert "[swallowed 4x __main__.Rejected: r1:e1]" in lines[1]
-    assert "more calls in" in lines[-2] and "(11 step; 4 raised)" in lines[-2]
+    assert lines[-2] == (
+        f"... 11 of the 12 calls directly below {address} are not shown "
+        "(11 step; 4 raised): --offset 1"
+    )
 
 
 def test_exceptions_lists_swallowed_first(
