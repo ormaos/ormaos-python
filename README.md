@@ -2,7 +2,7 @@
 
 Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent.
 
-> Status: being built for Hack Brasil 2026. `ormaos run` records calls and exceptions. The verbs that navigate a recording are not built yet.
+> Status: being built for Hack Brasil 2026. `ormaos run` records calls and exceptions, and `ormaos show` gives the overview of a recording. The verbs that navigate inside a recording are not built yet.
 
 ## What works today
 
@@ -32,13 +32,22 @@ The recording is in `.ormaos/r1/`, as JSON lines (`"format": "provisional-0"`, i
 - `exceptions`: every exception that passes through your code, where it was raised and where it was handled, marked `swallowed` when it was handled and not raised again.
 - `not_collected`: everything that was not recorded, with the reason.
 
+The same overview as JSON, for a coding agent or a script:
+
+```bash
+ormaos run --json-out overview.json -- python job.py   # written next to the run
+ormaos show --json last                                # or r1, r2, ...
+```
+
+The JSON goes to the file or to stdout, never mixed with the program's output. It has the context, the counts, the swallowed exceptions grouped by handler (with where they were raised and how many times), the uncaught ones, `not_collected`, and `next`: the addresses to ask about next.
+
 Shape always, value never: Ormaos records types, lengths and structure (`{"type": "str", "len": 14}`), never the content of an argument, an environment variable or an exception message.
 
 ## Limits today
 
 - The Python that the command starts must have `ormaos` installed in its environment. If not, the command still runs and the summary says that no Python process was recorded.
 - "Your code" is every file outside the standard library and outside `site-packages`. Set `ORMAOS_ONLY` to a list of paths to narrow it.
-- For a `try` with several `except` clauses, the handler line is the first clause.
+- The handler line is the `except` clause that matched. Two rare cases may show an earlier clause of the same `try`: `except*`, and a clause whose types span several lines.
 - Recording costs time on every call, and the files are large for long runs. At most 200,000 calls and 50,000 exceptions are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`); the rest is listed in `not_collected`. The cost is not measured yet.
 - A process that is killed, or that ends with `os._exit`, loses its last events. The recording says so.
 - Tested on Linux only.
