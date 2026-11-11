@@ -11,6 +11,7 @@ from typing import Any
 from ormaos.recording import FORMAT, ROOT, Process, Record, Recording, recording_numbers
 from ormaos.summary import display_path, swallowed_groups
 
+VERSION = 1
 MAX_GROUPS = 10
 MAX_ADDRESSES = 5
 
@@ -115,10 +116,14 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
 
     following = [group[0]["addr"] for group in groups[:MAX_ADDRESSES]]
     following += [exc["addr"] for exc in uncaught[:MAX_ADDRESSES]]
+    commands = [f"ormaos exceptions {addr}" for addr in following]
     if calls:
         following.append(calls[0]["addr"])
+        commands.append(f"ormaos tree {calls[0]['addr']}")
 
     return {
+        "kind": "show",
+        "version": VERSION,
         "format": FORMAT,
         "recording": recording.name,
         "path": display_path(recording.path, cwd),
@@ -155,4 +160,5 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
         ],
         "not_collected": not_collected,
         "next": following,
+        "next_commands": commands,
     }

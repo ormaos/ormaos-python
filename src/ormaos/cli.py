@@ -1,13 +1,77 @@
 """The ``ormaos`` command line."""
 
 import argparse
-from collections.abc import Sequence
+import json
+import os
+import sys
+from collections.abc import Callable, Sequence
+from typing import Any, NoReturn
 
 from ormaos import __version__
 
+_ADDRESS_HELP = (
+    "`last` (the default), a recording such as r3, or an address inside one: "
+    "r3:c42 (a call), r3:e5 (an exception)"
+)
+
+
+class _Parser(argparse.ArgumentParser):
+    """With ``--json`` on the command line, usage errors are JSON too."""
+
+    argv: Sequence[str] = ()
+
+    def error(self, message: str) -> NoReturn:
+        if "--json" in _Parser.argv:
+            from ormaos.verbs import error_document
+
+            doc = error_document(message, ["ormaos --help"])
+            print(json.dumps(doc, indent=2))
+            raise SystemExit(2)
+        super().error(message)
+
+
+def _positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+def _not_negative(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def _reader(
+    commands: Any, name: str, summary: str, description: str, limit: int | None
+) -> argparse.ArgumentParser:
+    verb: argparse.ArgumentParser = commands.add_parser(
+        name, help=summary, description=description
+    )
+    verb.add_argument("address", nargs="?", default="last", help=_ADDRESS_HELP)
+    verb.add_argument("--json", action="store_true", help="print JSON on stdout")
+    if limit is not None:
+        verb.add_argument(
+            "--limit",
+            type=_positive,
+            default=limit,
+            metavar="N",
+            help=f"show at most N entries (default {limit})",
+        )
+        verb.add_argument(
+            "--offset",
+            type=_not_negative,
+            default=None,
+            metavar="N",
+            help="skip the first N entries",
+        )
+    return verb
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="ormaos",
         description=(
             "Records what happened inside a Python execution and hands it "
@@ -23,11 +87,21 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser(
         "run",
         help="run a command and record the Python processes it starts",
-        usage="ormaos run [--json-out FILE] -- <command> [args...]",
+        usage="ormaos run [--path SCOPE] [--json-out FILE] -- <command> [args...]",
         description=(
             "Runs the command unchanged, records the Python processes it "
             "starts into .ormaos/, prints a summary of at most 5 lines on "
             "stderr, and exits with the command's exit code."
+        ),
+    )
+    run.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        metavar="SCOPE",
+        help=(
+            "also record line by line inside SCOPE: file.py, file.py:function "
+            "or function (can be given more than once)"
         ),
     )
     run.add_argument(
@@ -36,50 +110,106 @@ def build_parser() -> argparse.ArgumentParser:
         help="also write the overview of the recording to FILE, as JSON",
     )
     run.add_argument("command", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    show = commands.add_parser(
+    _reader(
+        commands,
         "show",
-        help="show the overview of a recording",
-        description="Shows the overview of a recording from .ormaos/.",
+        "show the overview of a recording",
+        "Shows the overview of a recording from .ormaos/: what ran, the counts, "
+        "the swallowed and the uncaught exceptions, and where to look next.",
+        None,
     )
-    show.add_argument(
-        "recording",
-        nargs="?",
-        default="last",
-        help="`last` (the default), or a recording such as r3",
+    tree = _reader(
+        commands,
+        "tree",
+        "show the calls below an address",
+        "Shows the call tree below a recording or a call: the shape of the "
+        "arguments and of the result, where each call is, how long it took.",
+        30,
     )
-    show.add_argument("--json", action="store_true", help="print JSON on stdout")
+    tree.add_argument(
+        "--depth",
+        type=_not_negative,
+        default=2,
+        metavar="N",
+        help="how many levels below the address (default 2)",
+    )
+    _reader(
+        commands,
+        "exceptions",
+        "show the exceptions of an address, swallowed first",
+        "For a recording or a call: its exceptions, swallowed first. For one "
+        "exception: where it was raised, the calls it left, where it was handled.",
+        20,
+    )
+    _reader(
+        commands,
+        "path",
+        "show the lines a call ran, in order",
+        "Shows line by line what a call ran, with the calls it made and the "
+        "exceptions it handled in between. Lines exist only for calls inside "
+        "the scope given to `ormaos run --path`.",
+        40,
+    )
     return parser
 
 
-def _show(ref: str, as_json: bool) -> int:
-    import json
-    import os
-    import sys
+def _answer(build: Callable[[], dict[str, Any]], as_json: bool) -> int:
+    """Print one answer: JSON or text on stdout; an error in the same form."""
+    from ormaos.render import render
+    from ormaos.show import NotFound
+    from ormaos.summary import PREFIX
+    from ormaos.verbs import Problem, error_document
 
-    from ormaos.recording import load
-    from ormaos.show import NotFound, document, find
-    from ormaos.summary import PREFIX, summarize
-
+    code = 0
     try:
-        recording = load(find(ref))
-    except (NotFound, OSError) as err:
-        message = str(err) if isinstance(err, NotFound) else type(err).__name__
-        if as_json:
-            print(json.dumps({"error": message}))
-        else:
-            print(f"{PREFIX}{message}", file=sys.stderr)
-        return 1
-    cwd = os.getcwd()
+        doc = build()
+    except Problem as err:
+        doc, code = error_document(str(err), err.commands), 1
+    except NotFound as err:
+        doc, code = error_document(str(err), ["ormaos run -- <command>"]), 1
+    except OSError as err:
+        doc, code = (
+            error_document(f"cannot read the recording ({type(err).__name__})"),
+            1,
+        )
     if as_json:
-        print(json.dumps(document(recording, cwd), indent=2))
+        print(json.dumps(doc, indent=2))
+    elif code:
+        for line in render(doc):
+            print(PREFIX + line, file=sys.stderr)
     else:
-        for line in summarize(recording, cwd):
-            print(line.removeprefix(PREFIX))
-    return 0
+        for line in render(doc):
+            print(line)
+    return code
+
+
+def _read(args: argparse.Namespace) -> int:
+    from ormaos import verbs
+    from ormaos.show import document
+
+    cwd = os.getcwd()
+
+    def build() -> dict[str, Any]:
+        target = verbs.resolve(args.address)
+        if args.verb == "show":
+            if target.kind != "recording":
+                raise verbs.Problem(
+                    f"`show` takes a recording; {target.address} is inside one",
+                    [f"ormaos show {target.recording.name}"],
+                )
+            return document(target.recording, cwd)
+        if args.verb == "tree":
+            return verbs.tree(target, cwd, args.limit, args.depth, args.offset or 0)
+        if args.verb == "exceptions":
+            return verbs.exceptions(target, cwd, args.limit, args.offset or 0)
+        return verbs.path(target, cwd, args.limit, args.offset)
+
+    return _answer(build, args.json)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    _Parser.argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
     if args.verb == "run":
         command = list(args.command)
@@ -89,8 +219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("run needs a command: ormaos run -- <command> [args...]")
         from ormaos.runner import run
 
-        return run(command, json_out=args.json_out)
-    if args.verb == "show":
-        return _show(args.recording, args.json)
+        return run(command, json_out=args.json_out, path=args.path)
+    if args.verb in ("show", "tree", "exceptions", "path"):
+        return _read(args)
     parser.print_help()
     return 0

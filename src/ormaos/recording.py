@@ -4,8 +4,9 @@ A recording is a directory ``.ormaos/r<N>/`` with one ``run.jsonl`` (written
 by ``ormaos run``) and one ``p<pid>-<time>.jsonl`` per Python process. Every
 file starts with a header line carrying ``"format": "provisional-0"``.
 
-Addresses (``r3:c42``, ``r3:e5``) are given here, at read time: processes in
-start order, then records in the order they were created in each process.
+Addresses (``r3:c42``, ``r3:e5``, ``r3:i7``) are given here, at read time:
+processes in start order, then records in the order they were created in each
+process.
 """
 
 import json
@@ -29,6 +30,7 @@ class Process:
     header: Record
     calls: list[Record] = field(default_factory=list)
     exceptions: list[Record] = field(default_factory=list)
+    io: list[Record] = field(default_factory=list)
     not_collected: list[Record] = field(default_factory=list)
     end: Record | None = None
 
@@ -53,6 +55,10 @@ class Recording:
     @property
     def exceptions(self) -> list[Record]:
         return [exc for proc in self.processes for exc in proc.exceptions]
+
+    @property
+    def io(self) -> list[Record]:
+        return [event for proc in self.processes for event in proc.io]
 
 
 def recording_numbers(root: str) -> list[int]:
@@ -107,6 +113,8 @@ def _load_process(path: str) -> Process:
             proc.calls.append(rec)
         elif kind == "exc":
             proc.exceptions.append(rec)
+        elif kind == "io":
+            proc.io.append(rec)
         elif kind == "not_collected":
             proc.not_collected.append(rec)
         elif kind == "end":
@@ -125,7 +133,22 @@ def _load_process(path: str) -> Process:
         )
     proc.calls.sort(key=lambda rec: rec.get("id", 0))
     proc.exceptions.sort(key=lambda rec: rec.get("id", 0))
+    proc.io.sort(key=lambda rec: rec.get("id", 0))
     return proc
+
+
+def _path(steps: Any, call_addr: dict[Any, str], exc_addr: dict[Any, str]) -> list[Any]:
+    """Line numbers stay; the marks ``c12`` and ``e3`` become addresses."""
+    out: list[Any] = []
+    for step in steps if isinstance(steps, list) else []:
+        if isinstance(step, int):
+            out.append(step)
+        elif isinstance(step, str) and step[1:].isdigit():
+            table = call_addr if step[0] == "c" else exc_addr
+            addr = table.get(int(step[1:]))
+            if addr is not None:
+                out.append(addr)
+    return out
 
 
 def load(path: str) -> Recording:
@@ -153,6 +176,7 @@ def load(path: str) -> Recording:
     prefix = recording.name
     call_n = 0
     exc_n = 0
+    io_n = 0
     for index, proc in enumerate(processes, start=1):
         proc.index = index
         call_addr: dict[Any, str] = {}
@@ -167,13 +191,28 @@ def load(path: str) -> Recording:
             exc["process"] = index
         for call in proc.calls:
             call["parent_addr"] = call_addr.get(call.get("parent"))
+            if "path" in call:
+                call["path"] = _path(call["path"], call_addr, exc_addr)
+        for event in proc.io:
+            io_n += 1
+            event["addr"] = f"{prefix}:i{io_n}"
+            event["process"] = index
+            event["call_addr"] = call_addr.get(event.get("call"))
         for exc in proc.exceptions:
             exc["call_addr"] = call_addr.get(exc.get("at", {}).get("call"))
+            exc["handled_addr"] = call_addr.get(exc.get("handled", {}).get("call"))
             for key in ("during", "replaced_by"):
                 if key in exc:
                     exc[f"{key}_addr"] = exc_addr.get(exc[key])
         recording.not_collected.extend(proc.not_collected)
     recording.processes = processes
+    scopes = sorted(
+        {str(s) for proc in processes for s in proc.header.get("path_scope", [])}
+    )
+    if scopes and not any("path" in call for call in recording.calls):
+        recording.not_collected.append(
+            _note("path", f"no call matched the scope {', '.join(scopes)}")
+        )
     if not processes:
         recording.not_collected.append(
             _note(
