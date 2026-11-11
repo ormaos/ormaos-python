@@ -194,6 +194,54 @@ def test_call_limit_is_reported(work: Workdir) -> None:
     assert "limit of 10 calls" in recording.not_collected[0]["reason"]
 
 
+def test_exception_limit_is_reported(work: Workdir) -> None:
+    code = (
+        "def f():\n    try:\n        raise KeyError\n    except KeyError:\n"
+        "        pass\nfor _ in range(50):\n    f()\n"
+    )
+    work.python("-c", code, env={"ORMAOS_MAX_EXCEPTIONS": "10"})
+    recording = work.last()
+    assert len(recording.exceptions) == 10
+    assert "limit of 10 exceptions" in recording.not_collected[0]["reason"]
+
+
+def test_line_limit_is_reported(work: Workdir) -> None:
+    work.write(
+        "loop.py", "def f():\n    a = 1\n    return a\nfor _ in range(50):\n    f()\n"
+    )
+    command = ("run", "--path", "f", "--", sys.executable, "loop.py")
+    result = work.cli(*command, env={"ORMAOS_MAX_LINES": "10"})
+    assert result.returncode == 0
+    recording = work.last()
+    assert sum(len(call.get("path", ())) for call in recording.calls) == 10
+    assert "limit of 10 lines" in recording.not_collected[0]["reason"]
+
+
+def test_no_free_tool_id_is_reported(work: Workdir) -> None:
+    # The program takes both tool ids before the recorder starts (`-S`: the
+    # recorder starts when the program runs `site.main()`).
+    source = (
+        "import sys\n"
+        "sys.monitoring.use_tool_id(3, 'one')\n"
+        "sys.monitoring.use_tool_id(4, 'two')\n"
+        "import site\n"
+        "site.main()\n"
+        "def f():\n"
+        "    return 1\n"
+        "print(f(), sys.monitoring.get_tool(3), sys.monitoring.get_tool(4))\n"
+    )
+    work.write("taken.py", source)
+    result = work.python("-S", "taken.py")
+    assert (result.returncode, result.stdout) == (0, "1 one two\n")
+    recording = work.last()
+    assert recording.calls == []
+    assert recording.not_collected[0] == {
+        "k": "not_collected",
+        "what": "everything",
+        "reason": "no free sys.monitoring tool id (3 and 4 are in use)",
+    }
+
+
 def test_without_ormaos_dir_nothing_happens(work: Workdir) -> None:
     result = work.plain(
         sys.executable, "-c", "import sys; print(sys.monitoring.get_tool(4))"

@@ -134,9 +134,16 @@ def test_the_job_behaves_the_same_with_and_without_ormaos(
     assert recorded.stdout == plain.stdout
     assert recorded.program_stderr == plain.stderr
     assert stock_recorded == stock_plain
-    # Nothing went wrong inside Ormaos while recording.
+    # Nothing went wrong inside Ormaos while recording. What it saw and did
+    # not record: the export is read by `csv.DictReader`, inside C code; and
+    # with the API source, the job starts its own local server.
     recording = demo.last()
-    assert recording.not_collected == []
+    opened = demo.line_with("fetch.py", "with open(path")
+    expected = [f"io: reads of the 1 file opened at fetch.py:{opened}"]
+    if source == "api":
+        bound = demo.line_with("fetch.py", "ThreadingHTTPServer((")
+        expected.append(f"io: sockets, at fetch.py:{bound} (once)")
+    assert [note["what"] for note in recording.not_collected] == expected
     assert all(process.end is not None for process in recording.processes)
 
 
@@ -153,7 +160,9 @@ def test_the_job_behaves_the_same_with_line_by_line_recording(demo: Demo) -> Non
     assert recorded.program_stderr == plain.stderr
     assert demo.stock() == stock_plain
     recording = demo.last()
-    assert recording.not_collected == []
+    assert [note["what"].split(" at ")[0] for note in recording.not_collected] == [
+        "io: reads of the 1 file opened"
+    ]
     assert sum(1 for call in recording.calls if "path" in call) > 10
 
 

@@ -307,7 +307,12 @@ def test_a_trace_callback_the_program_had_already_set_is_kept(work: Workdir) -> 
         ("select ?", 1),
         ("select a from t", 1),
     ]
-    assert work.last().not_collected == []
+    # sqlite3 prints the traceback of the callback and reads the source for
+    # it inside C code: an `open` with no `read` call.
+    line = source.count("\n", 0, source.index("conn.execute(\"select 'boom'")) + 1
+    assert [n["what"] for n in work.last().not_collected] == [
+        f"io: reads of the 1 file opened at program.py:{line}"
+    ]
 
 
 def test_a_connection_is_not_kept_when_its_thread_goes_quiet(work: Workdir) -> None:
@@ -332,7 +337,159 @@ def test_a_connection_is_not_kept_when_its_thread_goes_quiet(work: Workdir) -> N
     assert any(
         "ran no Python code of its own for a second" in n["reason"] for n in notes
     )
-    assert all(n["what"].startswith("io: the statements of sqlite3") for n in notes)
+    whats = [n["what"] for n in notes]
+    assert whats[-1] == "io with no line of user code (3 events: 3 sqlite)"
+    assert all(w.startswith("io: the statements of sqlite3") for w in whats[:-1])
+
+
+def notes_of(work: Workdir, source: str) -> dict[str, str]:
+    """Run the program plain and recorded; the same behaviour; the notes."""
+    work.write("program.py", source)
+    plain = work.plain(sys.executable, "program.py")
+    for left in ("made.txt", "printed.txt", "rows.csv"):
+        (work.path / left).unlink(missing_ok=True)
+    result = work.python("program.py")
+    assert plain.returncode == 0, plain.stderr
+    assert (result.returncode, result.stdout) == (0, plain.stdout)
+    assert result.program_stderr == plain.stderr
+    return {n["what"]: n["reason"] for n in work.last().not_collected}
+
+
+def test_a_file_read_or_written_inside_c_code_is_reported(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    source = (
+        "import csv\n"
+        "with open('made.txt', 'w') as out:  # written by a call\n"
+        "    out.write('a,b\\n1,2\\n')\n"
+        "with open('made.txt') as handle:  # iterated\n"
+        "    print([line.strip() for line in handle])\n"
+        "with open('printed.txt', 'w') as out:  # printed\n"
+        "    print('x', file=out)\n"
+        "with open('rows.csv', 'w', newline='') as out:  # csv writer\n"
+        "    csv.writer(out).writerow([1, 2])\n"
+        "with open('rows.csv', newline='') as handle:  # csv reader\n"
+        "    print(list(csv.reader(handle)))\n"
+        "with open('printed.txt') as handle:  # read by a call\n"
+        "    print(handle.read())\n"
+    )
+    notes = notes_of(work, source)
+    # `made.txt` is written by a call and never read by one; `rows.csv` is
+    # neither; `printed.txt` is read by a call and never written by one.
+    reads, writes = "io: reads of the 1 file", "io: writes to the 1 file"
+    assert sorted(notes) == [
+        f"{reads} opened at program.py:{line_of(source, 'csv reader')}",
+        f"{reads} opened at program.py:{line_of(source, 'iterated')}",
+        f"{writes} opened at program.py:{line_of(source, 'printed')}",
+        f"{writes} opened at program.py:{line_of(source, 'csv writer')}",
+    ]
+    assert all("inside C code" in reason for reason in notes.values())
+    ops = [(g["op"], g["target"]) for g in groups(work, "r1")]
+    assert ("write", "made.txt") in ops and ("read", "printed.txt") in ops
+    assert ("read", "made.txt") not in ops and ("write", "rows.csv") not in ops
+
+
+def test_an_open_that_fails_is_marked(work: Workdir) -> None:
+    source = (
+        "for name in (__file__, __file__, 'missing.txt', 'missing.txt'):\n"
+        "    try:\n"
+        "        with open(name) as handle:\n"
+        "            handle.read()\n"
+        "    except FileNotFoundError:\n"
+        "        print('missing')\n"
+    )
+    notes = notes_of(work, source)
+    assert notes == {}
+    opens = [e for e in work.last().io if e["op"] == "open"]
+    assert [(os.path.basename(e["target"]), e.get("out")) for e in opens] == [
+        ("program.py", None),
+        ("program.py", None),
+        ("missing.txt", "raised"),
+        ("missing.txt", "raised"),
+    ]
+    text = work.cli("io", "r1").stdout
+    assert "2x file open missing.txt (read) -> raised  at program.py:3" in text
+
+
+def test_sockets_are_reported(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    source = (
+        "import socket\n"
+        "server = socket.socket()\n"
+        "server.bind(('127.0.0.1', 0))  # bind\n"
+        "server.listen()\n"
+        "for _ in range(2):\n"
+        "    client = socket.create_connection(server.getsockname())  # connect\n"
+        "    client.close()\n"
+        "server.close()\n"
+    )
+    notes = notes_of(work, source)
+    assert sorted(notes) == [
+        f"io: sockets, at program.py:{line_of(source, 'bind')} (once)",
+        f"io: sockets, at program.py:{line_of(source, 'connect')} (2 times)",
+    ]
+    assert all("sockets are not recorded" in reason for reason in notes.values())
+
+
+def test_directory_operations_are_reported(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    source = (
+        "import os\n"
+        "os.mkdir('made')  # mkdir\n"
+        "for _ in range(3):\n"
+        "    names = os.listdir('.')  # listdir\n"
+        "os.rename('made', 'moved'); os.rmdir('moved')  # two\n"
+        "print('made' in names)\n"
+    )
+    notes = notes_of(work, source)
+    what = "io: directory and file-system operations, at program.py:"
+    assert sorted(notes) == [
+        f"{what}{line_of(source, 'mkdir')} (once)",
+        f"{what}{line_of(source, 'listdir')} (3 times)",
+        f"{what}{line_of(source, 'two')} (2 times)",
+    ]
+
+
+def test_reads_and_writes_on_a_file_descriptor_are_reported(
+    work: Workdir, line_of: Callable[[str, str], int]
+) -> None:
+    source = (
+        "import os, subprocess, sys\n"
+        "fd = os.open('made.txt', os.O_WRONLY | os.O_CREAT)\n"
+        "os.write(fd, b'abc')  # write\n"
+        "os.close(fd)\n"
+        "fd = os.open('made.txt', os.O_RDONLY)\n"
+        "print(os.read(fd, 10))  # read\n"
+        "os.close(fd)\n"
+        "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+    )
+    notes = notes_of(work, source)
+    what = "io: `os.read` and `os.write`, at program.py:"
+    fd_notes = sorted(w for w in notes if w.startswith(what))
+    assert fd_notes == [
+        f"{what}{line_of(source, 'write')} (once)",
+        f"{what}{line_of(source, 'read')} (once)",
+    ]
+
+
+def test_io_with_no_line_of_user_code_is_counted(work: Workdir) -> None:
+    source = (
+        "import os, threading\n"
+        "def nothing():\n"
+        "    pass\n"
+        "nothing()\n"
+        "for _ in range(2):\n"
+        "    thread = threading.Thread(target=os.listdir, args=('.',))\n"
+        "    thread.start()\n"
+        "    thread.join()\n"
+    )
+    notes = notes_of(work, source)
+    assert list(notes) == [
+        "io with no line of user code "
+        "(2 events: 2 directory and file-system operations)"
+    ]
 
 
 def test_io_can_be_turned_off(work: Workdir) -> None:

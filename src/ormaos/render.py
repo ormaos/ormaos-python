@@ -288,7 +288,8 @@ def io_label(entry: Doc) -> str:
         return f"sqlite {_cut(str(entry.get('sql')), 72)}"
     if kind == "file":
         mode = f" ({entry['mode']})" if entry.get("mode") else ""
-        return f"file {op} {entry.get('target')}{mode}"
+        tail = f" -> {entry['out']}" if entry.get("out") else ""
+        return f"file {op} {entry.get('target')}{mode}{tail}"
     if kind == "subprocess":
         return f"subprocess {op} {entry.get('target')}"
     if kind == "http":

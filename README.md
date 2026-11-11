@@ -108,7 +108,14 @@ How it is observed. Ormaos replaces and wraps nothing: `open` is still `open`, a
 - `read` and `write` on a file, and the status of an HTTP response, are seen through `sys.monitoring`. `requests` and `httpx` are never imported by Ormaos: their code is recognised when your program runs it.
 - sqlite3 has no event for statements. So Ormaos sets the trace callback of each connection (`Connection.set_trace_callback`), as soon as the connection is made: this is the one place where it sets something on an object of your program. If your program sets or clears the trace callback itself, your choice stays and works as always; the statements of that connection are not recorded after that, and `not_collected` names the connection and the line (when the call is made by Python code; a call made from inside C code, such as `operator.methodcaller`, is not seen). If your program had already set a callback when Ormaos comes to set its own (this happens only when no Python call was seen in between), yours is kept: it is called after Ormaos's, with the same statement, in the same order, and what it raises is reported by sqlite3 as before. In that one case your callback has one more frame above it on the stack.
 
-Limits of `io`, also listed in `not_collected` of every recording: a file that is iterated (`for line in f`, `csv.reader(f)`) is read inside C code, so only its `open` is seen; an `open` is recorded when it is asked for, also when it then fails (the exception is recorded too); sockets, other databases, directory operations and `os.read`/`os.write` are not recorded; I/O that no line of your code is waiting for (the import system, library threads) is not recorded. A quoted name in SQL (`"stock"`) is kept only where a name is expected (after `FROM`, `INTO`, `UPDATE`, `JOIN`, ..., or next to a dot); anywhere else it is shown as `?`.
+Limits of `io`. The ones that depend on the run are listed in `not_collected` of the recording when they happen, with the line of your code:
+
+- A file that is iterated (`for line in f`, `csv.reader(f)`) or written by `print(..., file=f)` is read or written inside C code, so only its `open` is seen. A file that was opened and never seen read (or written) by a call is listed, with the line that opened it.
+- An `open` is recorded when it is asked for. When it fails, the event is marked `-> raised` (the exception is recorded too).
+- Sockets, directory and file-system operations (`os.listdir`, `os.mkdir`, `os.remove`, ...) and `os.read`/`os.write` are not recorded; each line of your code that does one is listed, with a count.
+- I/O that no line of your code is waiting for is not recorded. What the import system does is never counted; the rest (library threads, the interpreter printing a traceback) is counted in one line.
+- Other databases, and anything a C library does by itself, are never seen.
+- A quoted name in SQL (`"stock"`) is kept only where a name is expected (after `FROM`, `INTO`, `UPDATE`, `JOIN`, ..., or next to a dot); anywhere else it is shown as `?`.
 
 ### For coding agents: `ormaos guide`
 
@@ -138,7 +145,7 @@ Shape always, value never: Ormaos records types, lengths and structure (`{"type"
 
 - The Python that the command starts must have `ormaos` installed in its environment. If not, the command still runs and the summary says that no Python process was recorded.
 - "Your code" is every file outside the standard library and outside `site-packages`. Set `ORMAOS_ONLY` to a list of paths to narrow it.
-- The handler line is the `except` clause that matched. Two rare cases may show an earlier clause of the same `try`: `except*`, and a clause whose types span several lines.
+- The handler line is the `except` clause that matched, also when its types are written on several lines. For `except*` it is the first clause of the `try` (several clauses can each take a part of the group); the place is listed in `not_collected` when it happens.
 - Recording costs time on every call, and the files are large for long runs. At most 200,000 calls, 50,000 exceptions and 200,000 lines are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`, `ORMAOS_MAX_LINES`); the rest is listed in `not_collected`. The cost is not measured yet.
 - `path` has the lines of the functions inside the scope, not of the functions they call (those appear as calls).
 - At most 100,000 I/O events are kept per process (`ORMAOS_MAX_IO`). The same event repeated at the same line is one event with a count.

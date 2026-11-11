@@ -5,6 +5,7 @@ How each thing is seen (nothing is replaced or wrapped):
 
 - Audit events (``sys.addaudithook``, PEP 578): a file is opened, a sqlite3
   connection is made, a subprocess is started, ``http.client`` sends a request.
+- ``sys.monitoring`` C_RAISE events: a call of ``open`` raised.
 - ``sys.monitoring`` CALL events: Python code calls ``read`` or ``write`` on a
   file object.
 - ``sys.monitoring`` return events of two library functions:
@@ -45,6 +46,7 @@ _BUILTIN = type(len)  # `file.read` bound to one file, and builtin functions
 _TEXT = _io.TextIOWrapper
 _BUFFERED = (_io.BufferedReader, _io.BufferedWriter, _io.BufferedRandom)
 _FILE = _io.FileIO
+_MODULE = type(sys)
 
 _READS = frozenset({"read", "readline", "readlines", "readinto", "read1", "readall"})
 _WRITES = frozenset({"write", "writelines"})
@@ -52,16 +54,53 @@ _SET_TRACE = "set_trace_callback"
 # Call sites of these names stay on. `connect`, so that the trace callback of
 # a new sqlite3 connection is set as soon as `sqlite3.connect` returns;
 # `set_trace_callback`, to see the program set its own.
-_WATCHED = _READS | _WRITES | {"connect", _SET_TRACE}
+# `open`, to see it raise.
+_WATCHED = _READS | _WRITES | {"connect", _SET_TRACE, "open"}
 
 _HTTP_CLIENT = os.sep + os.path.join("http", "client.py")
 _HTTPX = os.sep + os.path.join("httpx", "_client.py")
 _SUBPROCESS = os.sep + "subprocess.py"
+_HTTP_LIBRARIES = (os.sep + "httpx" + os.sep, os.sep + "httpcore" + os.sep)
+
+# Things that are seen and not recorded: they are counted by line of user code
+# and listed in `not_collected` at the end.
+_GAPS = {
+    "socket": (
+        "io: sockets",
+        "a socket was connected or bound there; sockets are not recorded, only "
+        "HTTP made through http.client or httpx is",
+    ),
+    "fs": (
+        "io: directory and file-system operations",
+        "a directory was listed, or a file or directory was made, renamed, "
+        "changed or removed there; these are not recorded",
+    ),
+    "fd": (
+        "io: `os.read` and `os.write`",
+        "reads and writes on a file descriptor are not recorded",
+    ),
+}
+_FS_EVENTS = (
+    "os.listdir",
+    "os.scandir",
+    "os.mkdir",
+    "os.rmdir",
+    "os.remove",
+    "os.rename",
+    "os.link",
+    "os.symlink",
+    "os.chmod",
+    "os.chown",
+    "os.truncate",
+    "os.utime",
+)
 
 _GIVE_UP_NS = 1_000_000_000
 _MAX_TEXT = 200
 _MAX_WAITING = 1000
 _MAX_TRACE_NOTES = 20
+_MAX_GAPS = 200
+_MAX_GAP_NOTES = 40
 _FRAMES = 300
 
 _get_dict = object.__getattribute__
@@ -82,7 +121,9 @@ NOT_COLLECTED = [
         "what": "io: reads and writes of a file that are not a method call",
         "reason": "a read or a write is seen when Python code calls `read` or "
         "`write` on the file; iterating a file (`for line in f`, `csv.reader`) "
-        "happens inside C code, and only the `open` is seen",
+        "or `print(..., file=f)` happens inside C code, and only the `open` is "
+        "seen (the files opened and never seen read or written are listed "
+        "when it happens)",
     },
     {
         "what": "io: sqlite3 statements, after the program sets a trace callback",
@@ -98,12 +139,20 @@ NOT_COLLECTED = [
         "what": "io: other kinds",
         "reason": "only sqlite3, files (`open`, `read`, `write`), subprocesses "
         "and HTTP through http.client (urllib, requests, urllib3) or httpx are "
-        "recorded; not sockets, other databases, directories or `os.read`",
+        "recorded; not sockets, directory operations or `os.read` (listed with "
+        "the line when they happen), and not other databases or anything a C "
+        "library does by itself (never seen)",
+    },
+    {
+        "what": "io: the outcome of an `open` made from inside C code",
+        "reason": "an `open` is recorded when it is asked for; when it fails it "
+        "is marked `raised` if Python code called it, and not otherwise",
     },
     {
         "what": "io with no line of user code",
-        "reason": "I/O that no frame of user code is waiting for (the import "
-        "system, library threads, interpreter start and exit) is not recorded",
+        "reason": "I/O that no frame of user code is waiting for is not "
+        "recorded: the import system and interpreter start (never counted), "
+        "library threads and interpreter exit (counted when it happens)",
     },
 ]
 NOT_COLLECTED_OFF = [{"what": "io", "reason": "I/O recording was turned off (--no-io)"}]
@@ -114,6 +163,14 @@ def _int_env(name: str, default: int) -> int:
         return max(0, int(os.environ[name]))
     except (KeyError, ValueError):
         return default
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _times(count: int) -> str:
+    return "once" if count == 1 else f"{count} times"
 
 
 def _glued(out: list[str]) -> bool:
@@ -350,6 +407,20 @@ class IoRecorder:
         self._dbs = 0
         # id(connection) -> its number and our callback (not kept alive).
         self._tracers: dict[int, tuple[int, Any]] = {}
+        # What is seen and not recorded: (kind, file, line) -> times.
+        self._gaps: dict[tuple[str, str, int], int] = {}
+        self._gaps_left_out = 0
+        # I/O with no frame of user code, by kind.
+        self._orphans: dict[str, int] = {}
+        self._import = False
+        # Files opened: (path, "read" | "write" | "read+write") -> [file,
+        # line, opens]; and the paths that a `read` or a `write` call was
+        # seen on.
+        self._opened: dict[tuple[str, str], list[Any]] = {}
+        self._read: set[str] = set()
+        self._written: set[str] = set()
+        # Per thread: the `open` that is being made now.
+        self._opening: dict[int, tuple[dict[str, Any], tuple[str, str]]] = {}
         self._trace_notes = 0
         # Can this Python show the trace callback of a connection? None: not
         # asked yet. `_probing`: the thread that is asking, with a connection
@@ -370,7 +441,11 @@ class IoRecorder:
             "os.posix_spawn": self._exec,
             "os.fork": self._fork,
             "http.client.send": self._http_send,
+            "socket.connect": self._socket,
+            "socket.bind": self._socket,
         }
+        for event in _FS_EVENTS:
+            self._handlers[event] = self._fs
 
     # ------------------------------------------------------------ lifecycle
 
@@ -378,6 +453,7 @@ class IoRecorder:
         """Register the callbacks. Returns the events to turn on everywhere."""
         _mon.register_callback(tool, _EV.CALL, self._call)
         _mon.register_callback(tool, _EV.C_RETURN, self._c_return)
+        _mon.register_callback(tool, _EV.C_RAISE, self._c_raise)
         if not self._hooked:
             # An audit hook cannot be removed: when recording stops, it stays
             # and does nothing.
@@ -390,6 +466,7 @@ class IoRecorder:
         self._on = False
         _mon.register_callback(tool, _EV.CALL, None)
         _mon.register_callback(tool, _EV.C_RETURN, None)
+        _mon.register_callback(tool, _EV.C_RAISE, None)
 
     def reset(self) -> None:
         """In a forked child: forget what the parent was in the middle of."""
@@ -399,6 +476,13 @@ class IoRecorder:
         self._waiting = {}
         self._count = 0
         self._capped = False
+        self._gaps = {}
+        self._gaps_left_out = 0
+        self._orphans = {}
+        self._opened = {}
+        self._read = set()
+        self._written = set()
+        self._opening = {}
 
     def finish(self) -> None:
         """Write the events that were still open."""
@@ -411,17 +495,80 @@ class IoRecorder:
             rec["out"] = "no response seen"
             self._rec._emit(rec)
         self._waiting = {}
+        for what, reason in self._seen_not_recorded():
+            self._rec._note(what, reason)
+
+    def _seen_not_recorded(self) -> list[tuple[str, str]]:
+        """What was seen and is not in the recording, with the place."""
+        notes: list[tuple[str, str]] = []
+        base = os.path.basename
+        unread: dict[tuple[str, int], int] = {}
+        unwritten: dict[tuple[str, int], int] = {}
+        for (path, access), (file, line, _opens) in self._opened.items():
+            read, written = path in self._read, path in self._written
+            if access == "write":
+                if not written:
+                    unwritten[file, line] = unwritten.get((file, line), 0) + 1
+            elif not read and not (written and access == "read+write"):
+                unread[file, line] = unread.get((file, line), 0) + 1
+        for (file, line), files in unread.items():
+            notes.append(
+                (
+                    f"io: reads of the {_plural(files, 'file')} opened at "
+                    f"{base(file)}:{line}",
+                    "opened for reading, and no `read` call by Python code was "
+                    "seen on a file of that name: if it was read, that was inside "
+                    "C code (a file that is iterated, `for line in f`, "
+                    "`csv.reader`)",
+                )
+            )
+        for (file, line), files in unwritten.items():
+            notes.append(
+                (
+                    f"io: writes to the {_plural(files, 'file')} opened at "
+                    f"{base(file)}:{line}",
+                    "opened for writing, and no `write` call by Python code was "
+                    "seen on a file of that name: if it was written, that was "
+                    "inside C code (`print(..., file=f)`, `csv.writer`)",
+                )
+            )
+        for (kind, file, line), times in self._gaps.items():
+            what, reason = _GAPS[kind]
+            notes.append((f"{what}, at {base(file)}:{line} ({_times(times)})", reason))
+        left_out = len(notes) - _MAX_GAP_NOTES + self._gaps_left_out
+        if left_out > 0:
+            notes = notes[:_MAX_GAP_NOTES]
+            notes.append(
+                (
+                    f"io: {_plural(left_out, 'more place')} of the same kinds",
+                    f"only the first {_MAX_GAP_NOTES} places are listed",
+                )
+            )
+        if self._orphans:
+            kinds = ", ".join(f"{n} {kind}" for kind, n in self._orphans.items())
+            total = sum(self._orphans.values())
+            notes.append(
+                (
+                    f"io with no line of user code ({_plural(total, 'event')}: "
+                    f"{kinds})",
+                    "no frame of user code was waiting for them, so they are "
+                    "not recorded",
+                )
+            )
+        return notes
 
     # --------------------------------------------------------------- events
 
     def _site(self, frame: FrameType | None) -> FrameType | None:
         """The nearest frame of user code that is waiting for this I/O."""
         user_at = self._rec._user_at
+        self._import = False
         for _ in range(_FRAMES):
             if frame is None:
                 return None
             name = frame.f_code.co_filename
             if name.startswith("<frozen importlib"):
+                self._import = True
                 return None  # the import system reading a module
             if user_at(name, frame):
                 return frame
@@ -440,6 +587,7 @@ class IoRecorder:
         right after itself only adds to the count ``n`` of the first one."""
         site = self._site(frame)
         if site is None:
+            self._orphan(kind)
             return None
         recorder = self._rec
         state = recorder._thread_state()
@@ -482,6 +630,41 @@ class IoRecorder:
             self._held[ident] = (sig, rec)
         return rec
 
+    def _orphan(self, kind: str) -> None:
+        """I/O with no frame of user code. Counted once the program's own
+        code has started, and not for the import system."""
+        if not self._import and self._rec._ncalls:
+            self._orphans[kind] = self._orphans.get(kind, 0) + 1
+
+    def _gap(self, kind: str, frame: FrameType | None) -> None:
+        """Something that is seen and not recorded, counted by line."""
+        site = self._site(frame)
+        if site is None:
+            self._orphan(_GAPS[kind][0].removeprefix("io: "))
+            return
+        key = (kind, site.f_code.co_filename, site.f_lineno)
+        times = self._gaps.get(key, 0)
+        if not times and len(self._gaps) >= _MAX_GAPS:
+            self._gaps_left_out += 1
+            return
+        self._gaps[key] = times + 1
+
+    def _socket(self, args: Any, frame: FrameType) -> None:
+        at: FrameType | None = frame
+        for _ in range(_FRAMES):
+            if at is None:
+                break
+            name = at.f_code.co_filename
+            if name.endswith(_HTTP_CLIENT) or any(
+                lib in name for lib in _HTTP_LIBRARIES
+            ):
+                return  # the connection of a request that is recorded as HTTP
+            at = at.f_back
+        self._gap("socket", frame)
+
+    def _fs(self, args: Any, frame: FrameType) -> None:
+        self._gap("fs", frame)
+
     def _audit(self, event: str, args: Any) -> None:
         if not self._on:
             return
@@ -509,8 +692,41 @@ class IoRecorder:
         path = _name(args[0])
         if path is None or path.startswith(self._rec._dir):
             return
-        fields = {"target": path, "mode": _access(args[1], args[2])}
-        self._new("file", "open", frame, fields)
+        access = _access(args[1], args[2])
+        rec = self._new("file", "open", frame, {"target": path, "mode": access})
+        ident = _thread.get_ident()
+        if rec is None:
+            self._opening.pop(ident, None)
+            return
+        key = (path, "write" if access == "append" else access)
+        self._opening[ident] = (rec, key)
+        entry = self._opened.get(key)
+        if entry is None:
+            self._opened[key] = [rec["file"], rec["line"], 1]
+        else:
+            entry[2] += 1
+
+    def _open_raised(self) -> None:
+        """The `open` this thread was making raised: mark its event."""
+        ident = _thread.get_ident()
+        opening = self._opening.pop(ident, None)
+        held = self._held.get(ident)
+        if opening is None or held is None or held[1] is not opening[0]:
+            return
+        rec, key = opening
+        del self._held[ident]
+        if rec["n"] > 1:  # the ones before it, at the same line, did not raise
+            rec["n"] -= 1
+            self._rec._emit(rec)
+            rec = dict(rec, id=next(self._ids), n=1)
+            self._count += 1
+        rec["out"] = "raised"
+        self._rec._emit(rec)
+        entry = self._opened.get(key)
+        if entry is not None:
+            entry[2] -= 1
+            if entry[2] <= 0:
+                del self._opened[key]
 
     def _call(self, code: CodeType, offset: int, func: object, arg0: object) -> object:
         """Python code calls something. Only calls of `read` and `write` on a
@@ -528,16 +744,30 @@ class IoRecorder:
             name = func.__name__  # type: ignore[attr-defined]
             if name not in _WATCHED:
                 return _DISABLE
-            if name == "connect":
+            if name == "connect" or name == _SET_TRACE:
+                return None
+            if name == "open":
+                self._opening.pop(_thread.get_ident(), None)
                 return None
             if code.co_filename.startswith("<frozen"):
                 return _DISABLE
             path = _file_name(target)
-            if path is None or path.startswith(self._rec._dir):
+            if path is None:
+                module = tp is _BUILTIN and type(target) is _MODULE
+                if (
+                    module
+                    and target.__name__ in ("posix", "nt")  # type: ignore[attr-defined]
+                    and self._rec._owner != _thread.get_ident()
+                    and not code.co_filename.endswith(_SUBPROCESS)
+                ):
+                    self._gap("fd", sys._getframe(1))
+                return None
+            if path.startswith(self._rec._dir):
                 return None
             if self._rec._owner != _thread.get_ident():
                 op = "read" if name in _READS else "write"
                 self._new("file", op, sys._getframe(1), {"target": path})
+                (self._read if op == "read" else self._written).add(path)
         except Exception as err:
             self._rec._fail(err)
         return None
@@ -548,16 +778,25 @@ class IoRecorder:
         try:
             if self.pending:
                 self.install()
-            if self._tracers:
-                tp = type(func)
-                if tp is _METHOD:
-                    target = arg0
-                elif tp is _BUILTIN:
-                    target = func.__self__  # type: ignore[attr-defined]
-                else:
-                    return
-                if func.__name__ == _SET_TRACE:  # type: ignore[attr-defined]
-                    self._program_set(target, code)
+            tp = type(func)
+            if tp is _METHOD:
+                target = arg0
+            elif tp is _BUILTIN:
+                target = func.__self__  # type: ignore[attr-defined]
+            else:
+                return
+            name = func.__name__  # type: ignore[attr-defined]
+            if name == "open":
+                self._opening.pop(_thread.get_ident(), None)
+            elif name == _SET_TRACE and self._tracers:
+                self._program_set(target, code)
+        except Exception as err:
+            self._rec._fail(err)
+
+    def _c_raise(self, code: CodeType, offset: int, func: object, arg0: object) -> None:
+        try:
+            if type(func) is _BUILTIN and func.__name__ == "open":
+                self._open_raised()
         except Exception as err:
             self._rec._fail(err)
 
