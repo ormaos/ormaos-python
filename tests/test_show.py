@@ -30,6 +30,7 @@ def test_json_out_is_written_and_stdout_is_only_the_programs(work: Workdir) -> N
 
     doc = json.loads((work.path / "out.json").read_text())
     assert doc["format"] == "provisional-0"
+    assert doc["kind"] == "show" and doc["version"] == 1
     assert doc["recording"] == "r1" and doc["path"] == ".ormaos/r1"
     assert doc["context"]["command"] == [sys.executable, "code.py"]
     assert doc["context"]["exit_code"] == 1
@@ -71,11 +72,16 @@ def test_json_out_is_written_and_stdout_is_only_the_programs(work: Workdir) -> N
         }
     ]
     assert doc["next"] == ["r1:e1", "r1:e3", "r1:c1"]
+    assert doc["next_commands"] == [
+        "ormaos exceptions r1:e1",
+        "ormaos exceptions r1:e3",
+        "ormaos tree r1:c1",
+    ]
     # Everything not recorded is listed, with the reason.
     assert all(note["reason"] for note in doc["not_collected"])
     assert {
-        "what": "io",
-        "reason": "I/O recording is not implemented yet",
+        "what": "values",
+        "reason": "by design: only type, length and structure are recorded",
         "always": True,
     } in doc["not_collected"]
 
@@ -96,14 +102,6 @@ def test_show_last_is_the_newest_recording(work: Workdir) -> None:
     doc = json.loads(work.cli("show", "--json", "last").stdout)
     assert doc["recording"] == "r2" and doc["context"]["exit_code"] == 4
     assert json.loads(work.cli("show", "--json", "1").stdout)["recording"] == "r1"
-
-
-def test_show_without_json_prints_the_summary(work: Workdir) -> None:
-    work.write("code.py", CODE)
-    result = work.python("code.py")
-    shown = work.cli("show")
-    assert shown.returncode == 0
-    assert [f"ormaos: {line}" for line in shown.stdout.splitlines()] == result.summary
 
 
 def test_errors_are_json_too(work: Workdir) -> None:

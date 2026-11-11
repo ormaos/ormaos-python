@@ -22,7 +22,7 @@ raise SystemExit(3)
 """
 
 
-@pytest.mark.parametrize("fault", ["calls", "exceptions", "write"])
+@pytest.mark.parametrize("fault", ["calls", "exceptions", "write", "path"])
 def test_internal_error_in_a_callback_changes_nothing(
     work: Workdir, fault: str
 ) -> None:
@@ -30,7 +30,8 @@ def test_internal_error_in_a_callback_changes_nothing(
     plain = work.plain(sys.executable, "program.py")
     assert plain.returncode == 3
 
-    result = work.python("program.py", env={"ORMAOS_FAULT": fault})
+    env = {"ORMAOS_FAULT": fault, "ORMAOS_PATH": "program.py"}
+    result = work.python("program.py", env=env)
 
     assert result.returncode == plain.returncode
     assert result.stdout == plain.stdout
