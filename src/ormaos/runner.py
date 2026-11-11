@@ -83,10 +83,16 @@ def _wait(proc: subprocess.Popen[bytes]) -> int:
             signal.signal(signum, handler)
 
 
-def run(command: Sequence[str], json_out: str | None = None) -> int:
+def run(
+    command: Sequence[str],
+    json_out: str | None = None,
+    path: Sequence[str] = (),
+) -> int:
     cwd = os.getcwd()
     env = dict(os.environ)
     env.pop("ORMAOS_DIR", None)
+    if path:
+        env["ORMAOS_PATH"] = ",".join(path)
     directory: str | None = None
     run_file = ""
     try:

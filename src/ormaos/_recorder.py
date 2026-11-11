@@ -63,9 +63,13 @@ _ALWAYS_NOT_COLLECTED = [
         "reason": "for `except*`, and for a clause whose types span several "
         "lines, the handler line may be an earlier clause of the same `try`",
     },
-    {"what": "path", "reason": "line-by-line recording is not implemented yet"},
     {"what": "io", "reason": "I/O recording is not implemented yet"},
 ]
+_PATH_OFF = {
+    "what": "path",
+    "reason": "line-by-line recording is off; ask for a scope with "
+    "`ormaos run --path <file.py:function>`",
+}
 
 type _Call = dict[str, Any] | None
 type _Entry = tuple[CodeType, _Call]
@@ -97,6 +101,17 @@ def _int_env(name: str, default: int) -> int:
         return max(0, int(os.environ[name]))
     except (KeyError, ValueError):
         return default
+
+
+def _parse_scope(text: str) -> tuple[str | None, str | None]:
+    """A path scope: ``file.py``, ``file.py:function`` or ``function``."""
+    if ":" in text:
+        left, right = text.rsplit(":", 1)
+        if left and right and os.sep not in right and not right.endswith(".py"):
+            return os.path.normpath(left), right
+    if text.endswith(".py") or os.sep in text or "/" in text:
+        return os.path.normpath(text), None
+    return None, text
 
 
 def _injected_fault(*_args: object) -> Any:
@@ -224,6 +239,18 @@ class Recorder:
         self._max_exc = _int_env("ORMAOS_MAX_EXCEPTIONS", 50_000)
         self._calls_capped = False
         self._exc_capped = False
+        # Line-by-line recording, only inside the scopes of ORMAOS_PATH.
+        self._scope_text = [
+            part.strip()
+            for part in os.environ.get("ORMAOS_PATH", "").split(",")
+            if part.strip()
+        ]
+        self._scopes = [_parse_scope(part) for part in self._scope_text]
+        self._scope_known: dict[tuple[str, str], bool] = {}
+        self._path_codes: set[CodeType] = set()
+        self._nlines = 0
+        self._max_lines = _int_env("ORMAOS_MAX_LINES", 200_000)
+        self._lines_capped = False
         only = os.environ.get("ORMAOS_ONLY", "")
         self._only = tuple(
             os.path.abspath(part).rstrip(os.sep)
@@ -252,8 +279,9 @@ class Recorder:
             for event, callback in self._callbacks():
                 _mon.register_callback(tool, event, callback)
                 mask |= event
-            # LINE is never on everywhere: only for one code object, for the
-            # few lines after an exception enters a `try` with several clauses.
+            # LINE is never on everywhere: only for the code objects inside a
+            # path scope, and for one code object for the few lines after an
+            # exception enters a `try` with several clauses.
             _mon.register_callback(tool, _EV.LINE, self._line)
             self._install_fault()
             _mon.set_events(tool, mask)
@@ -267,6 +295,8 @@ class Recorder:
             setattr(self, "_args", _injected_fault)  # noqa: B010
         elif fault == "exceptions":
             setattr(self, "_origin", _injected_fault)  # noqa: B010
+        elif fault == "path":
+            setattr(self, "_in_scope", _injected_fault)  # noqa: B010
         elif fault == "write":
             setattr(self, "_write_out", _injected_fault)  # noqa: B010
 
@@ -292,6 +322,9 @@ class Recorder:
         for _flight, code, _lines in list(self._watching.values()):
             _mon.set_local_events(tool, code, 0)
         self._watching = {}
+        for code in self._path_codes:
+            _mon.set_local_events(tool, code, 0)
+        self._path_codes = set()
         for event, _callback in self._callbacks():
             _mon.register_callback(tool, event, None)
         _mon.register_callback(tool, _EV.LINE, None)
@@ -316,11 +349,32 @@ class Recorder:
                     "argv": _argv_shape(),
                     "cwd": os.getcwd(),
                     "started": time.time(),
-                    "capabilities": ["context", "calls", "exceptions"],
-                    "not_collected": _ALWAYS_NOT_COLLECTED,
+                    "capabilities": self._capabilities(),
+                    "path_scope": self._scope_text,
+                    "not_collected": self._always_not_collected(),
                 }
             ]
         )
+
+    def _capabilities(self) -> list[str]:
+        out = ["context", "calls", "exceptions"]
+        if self._scopes:
+            out.append("path")
+        return out
+
+    def _always_not_collected(self) -> list[dict[str, str]]:
+        notes = list(_ALWAYS_NOT_COLLECTED)
+        if self._scopes:
+            notes.append(
+                {
+                    "what": "path outside the scope",
+                    "reason": "lines are recorded only inside: "
+                    + ", ".join(self._scope_text),
+                }
+            )
+        else:
+            notes.append(_PATH_OFF)
+        return notes
 
     def _after_fork(self) -> None:
         """In a forked child: start a file of its own, forget the parent's state."""
@@ -334,9 +388,11 @@ class Recorder:
             self._active = {}
             self._handled = {}
             for _flight, code, _lines in list(self._watching.values()):
-                _mon.set_local_events(self._tool, code, 0)
+                if code not in self._path_codes:
+                    _mon.set_local_events(self._tool, code, 0)
             self._watching = {}
             self._ncalls = 0
+            self._nlines = 0
             self._nexc = 0
             self._t0 = time.perf_counter_ns()
             if self._fd >= 0:
@@ -408,6 +464,7 @@ class Recorder:
             "threads": len(self._threads),
             "calls": self._ncalls,
             "exceptions": self._nexc,
+            "lines": self._nlines,
             "stopped_early": self._dead,
         }
         try:
@@ -547,6 +604,38 @@ class Recorder:
                 return int(rec["id"])
         return None
 
+    def _in_scope(self, code: CodeType) -> bool:
+        """Is this code inside a path scope? Then its lines are recorded."""
+        key = (code.co_filename, code.co_qualname)
+        known = self._scope_known.get(key)
+        if known is None:
+            known = self._scope_known[key] = self._scope_match(*key)
+        if known and code not in self._path_codes:
+            self._path_codes.add(code)
+            _mon.set_local_events(self._tool, code, _EV.LINE)
+        return known
+
+    def _scope_match(self, filename: str, qualname: str) -> bool:
+        path = os.path.abspath(filename)
+        for file, fn in self._scopes:
+            if file is not None and not (
+                path == os.path.abspath(file) or path.endswith(os.sep + file)
+            ):
+                continue
+            if fn is not None and not (qualname == fn or qualname.endswith("." + fn)):
+                continue
+            return True
+        return False
+
+    def _mark(self, stack: list[_Entry], mark: str) -> None:
+        """Note a call or an exception inside the path of the running call."""
+        for _code, rec in reversed(stack):
+            if rec is not None:
+                path = rec.get("path")
+                if path is not None and self._nlines < self._max_lines:
+                    path.append(mark)
+                return
+
     def _args(self, code: CodeType, frame: FrameType) -> dict[str, Any]:
         flags = code.co_flags
         count = (
@@ -611,6 +700,10 @@ class Recorder:
                 "t": time.perf_counter_ns() - self._t0,
                 "args": self._args(code, sys._getframe(1)),
             }
+            if self._scopes:
+                self._mark(stack, f"c{rec['id']}")
+                if self._in_scope(code):
+                    rec["path"] = []
             stack.append((code, rec))
         except Exception as err:
             self._fail(err)
@@ -809,6 +902,8 @@ class Recorder:
                 "user": user,
                 "call": self._top(self._thread_state().stack) if user else None,
             }
+            if user and self._scopes:
+                self._mark(self._thread_state().stack, f"e{flight.rec['id']}")
             flight.frame = id(frame)
             flight.unwound = 0
             old = self._handled.get(key)
@@ -841,8 +936,13 @@ class Recorder:
             self._fail(err)
 
     def _line(self, code: CodeType, line: int) -> None:
-        """Runs only while we watch a frame to see which clause matches."""
+        """Runs inside a path scope, and while we watch a frame to see which
+        `except` clause matches."""
         try:
+            if code in self._path_codes:
+                self._step(code, line)
+            if not self._watching:
+                return
             frame = sys._getframe(1)
             watch = self._watching.get(id(frame))
             if watch is None:
@@ -860,11 +960,37 @@ class Recorder:
         except Exception as err:
             self._fail(err)
 
+    def _step(self, code: CodeType, line: int) -> None:
+        """One line of a call inside a path scope."""
+        stack = self._thread_state().stack
+        if not stack or stack[-1][0] is not code:
+            return
+        rec = stack[-1][1]
+        if rec is None:
+            return
+        path = rec.get("path")
+        if path is None:
+            return
+        if self._nlines >= self._max_lines:
+            rec["path_cut"] = True
+            if not self._lines_capped:
+                self._lines_capped = True
+                self._note(
+                    "path after this point",
+                    f"limit of {self._max_lines} lines per process reached "
+                    "(set ORMAOS_MAX_LINES to change it)",
+                )
+            return
+        self._nlines += 1
+        path.append(line)
+
     def _unwatch(self, frame_id: int) -> None:
         watch = self._watching.pop(frame_id, None)
         if watch is None or self._tool < 0:
             return
         code = watch[1]
+        if code in self._path_codes:
+            return  # its lines stay on: it is inside a path scope
         if not any(other[1] is code for other in self._watching.values()):
             _mon.set_local_events(self._tool, code, 0)
 
