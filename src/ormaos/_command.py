@@ -23,7 +23,8 @@ def hidden(text: str) -> str:
     return f"<str[{len(text)}]>"
 
 
-def _is_python(word: str) -> bool:
+def is_python(word: str) -> bool:
+    """Is this the name of a Python interpreter (`python3.12`, `pypy3`)?"""
     return _PYTHON.fullmatch(os.path.basename(word)) is not None
 
 
@@ -83,12 +84,12 @@ def shape_command(command: Sequence[str]) -> list[str]:
     if not words:
         return []
     out = [words[0]]
-    if _is_python(words[0]):
+    if is_python(words[0]):
         return out + _python(words[1:])
     for i, word in enumerate(words[1:], start=1):
         if _is_option(word):
             out.append(_option(word))
-        elif _is_python(word):
+        elif is_python(word):
             out.append(word)
             return out + _python(words[i + 1 :])
         elif word.endswith(".py"):

@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ormaos._command import is_python
+
 FORMAT = "provisional-0"
 ROOT = ".ormaos"
 
@@ -354,6 +356,41 @@ def _link(processes: list[Process]) -> None:
             }
 
 
+def _missing_children(processes: list[Process]) -> None:
+    """A process started Python programs that are not in the recording: said,
+    with how many. The I/O events of the process say how many it started;
+    the files of the recording say how many reported."""
+    for proc in processes:
+        started = 0
+        first: Record | None = None
+        for event in proc.io:
+            if (
+                event.get("kind") == "subprocess"
+                and event.get("op") == "spawn"
+                and is_python(str(event.get("target")))
+            ):
+                started += int(event.get("n", 1))
+                first = first or event
+        if not started or first is None:
+            continue
+        here = sum(
+            1
+            for other in processes
+            if other.parent == proc.index and not other.header.get("forked")
+        )
+        if started > here:
+            place = f"{os.path.basename(str(first.get('file')))}:{first.get('line')}"
+            proc.not_collected.append(
+                _note(
+                    f"{started - here} of the {started} Python programs that "
+                    f"process {proc.index} started (the first at {place})",
+                    "they are not in the recording: they ran a Python that has "
+                    "no ormaos installed, or that was started without its site "
+                    "packages (`-S`), or without ORMAOS_DIR in its environment",
+                )
+            )
+
+
 def _ending_notes(processes: list[Process]) -> None:
     for proc in processes:
         if proc.end is not None:
@@ -415,6 +452,7 @@ def load(path: str) -> Recording:
         ):
             proc.ending = {"signal": signum, "by": "outside", "process": None}
     _ending_notes(processes)
+    _missing_children(processes)
     prefix = recording.name
     call_n = 0
     exc_n = 0

@@ -25,7 +25,7 @@ from _weakref import ref as _weakref
 from types import CodeType, FrameType, ModuleType
 from typing import Any
 
-from ormaos._shape import shape, type_name
+from ormaos._shape import SAMPLE, shape, type_name
 
 FORMAT = "provisional-0"
 
@@ -346,6 +346,11 @@ class Recorder:
         self._ck_call = 0  # the highest call id already in a checkpoint
         self._base: int | None = None  # see _MP_BOOTSTRAP
         self._cells_noted = False
+        self._sampling_noted = False
+        # The threads that exist when recording starts late (a block): what
+        # they are in the middle of was not seen.
+        self._old_threads: frozenset[int] = frozenset()
+        self._old_threads_noted = False
         self._exits_seen: set[tuple[int, int]] = set()
         self._finishing = False
         self._failure: dict[str, Any] | None = None
@@ -401,6 +406,11 @@ class Recorder:
     def start(self) -> None:
         global ACTIVE
         try:
+            if self._started_by == "record":
+                here = _thread.get_ident()
+                self._old_threads = frozenset(
+                    ident for ident in sys._current_frames() if ident != here
+                )
             self._open(forked=False)
             ACTIVE = self
             atexit.register(self.finish)
@@ -572,6 +582,7 @@ class Recorder:
             self._task_refs = {}
             self._ck_call = 0
             self._exits_seen = set()
+            self._old_threads = frozenset()
             self._t0 = time.perf_counter_ns()
             self._last_write = self._t0
             if self._fd >= 0:
@@ -1013,6 +1024,12 @@ class Recorder:
         except AttributeError:
             index = len(self._threads) + 1
             state = self._tls.state = self._threads[index] = _ThreadState(index)
+            if (
+                self._old_threads
+                and not self._old_threads_noted
+                and _thread.get_ident() in self._old_threads
+            ):
+                self._note_old_thread()
         return state
 
     @staticmethod
@@ -1068,7 +1085,9 @@ class Recorder:
         out = {}
         for name in code.co_varnames[:count]:
             if name in local:
-                out[name] = shape(local[name])
+                found = out[name] = shape(local[name])
+                if "sampled" in found and not self._sampling_noted:
+                    self._note_sampling()
         if _LOCALS_ARE_A_COPY:
             # Python 3.12 keeps this dict on the frame, and with it every
             # argument, until the frame ends: emptied, so that an argument is
@@ -1076,6 +1095,27 @@ class Recorder:
             # filled again whenever something asks for the locals.)
             local.clear()
         return out
+
+    def _note_sampling(self) -> None:
+        self._sampling_noted = True
+        self._note(
+            f"the types of the items after the first {SAMPLE} of a container",
+            f"a list, tuple, set or dict with more than {SAMPLE} items was an "
+            f"argument or a result: its length is exact, and `items`, `keys` "
+            f"and `values` count the types of its first {SAMPLE} items only "
+            "(the shape says `sampled`)",
+        )
+
+    def _note_old_thread(self) -> None:
+        self._old_threads_noted = True
+        self._note(
+            "what threads that were already running did before recording started",
+            f"{len(self._old_threads)} other threads were running when recording "
+            "started in this process (a `with ormaos.record():` block). Of "
+            "those threads, only the calls that start after that are recorded, "
+            "as calls with no call above them; the calls they were already "
+            "inside are not",
+        )
 
     def _pop(self, code: CodeType) -> _Entry | None:
         stack = self._thread_state().stack
@@ -1102,7 +1142,9 @@ class Recorder:
         rec["dur"] = time.perf_counter_ns() - self._t0 - rec["t"]
         rec["out"] = out
         if out == "returned":
-            rec["ret"] = shape(ret)
+            found = rec["ret"] = shape(ret)
+            if "sampled" in found and not self._sampling_noted:
+                self._note_sampling()
         # A call with no call of the user's code above it has ended (a thread
         # function, a request handler), or a task of a multiprocessing worker:
         # written right away, because such a process is often ended with a

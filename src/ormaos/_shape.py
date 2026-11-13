@@ -8,7 +8,8 @@ through the descriptors of ``type`` itself, which a metaclass cannot override.
 from itertools import islice
 from typing import Any
 
-_SAMPLE = 50
+# The types of the items of a container are taken from its first items only.
+SAMPLE = 50
 
 _get_module = type.__dict__["__module__"].__get__
 _get_qualname = type.__dict__["__qualname__"].__get__
@@ -34,7 +35,7 @@ def type_name(tp: type) -> str:
 def _kinds(items: Any) -> dict[str, int]:
     """Count the types of the first items of a builtin container."""
     counts: dict[str, int] = {}
-    for item in islice(items, _SAMPLE):
+    for item in islice(items, SAMPLE):
         name = type_name(type(item))
         counts[name] = counts.get(name, 0) + 1
     return counts
@@ -50,6 +51,8 @@ def shape(value: object) -> dict[str, Any]:
     if key in _SEQUENCES:
         size = len(value)  # type: ignore[arg-type]
         out: dict[str, Any] = {"type": _get_name(tp), "len": size}
+        if size > SAMPLE:
+            out["sampled"] = SAMPLE  # `items` is about the first ones only
         if size:
             try:
                 out["items"] = _kinds(value)
@@ -59,6 +62,8 @@ def shape(value: object) -> dict[str, Any]:
     if tp is dict:
         size = len(value)  # type: ignore[arg-type]
         out = {"type": "dict", "len": size}
+        if size > SAMPLE:
+            out["sampled"] = SAMPLE
         if size:
             try:
                 out["keys"] = _kinds(value)

@@ -97,6 +97,9 @@ _FS_EVENTS = (
 
 _GIVE_UP_NS = 1_000_000_000
 _MAX_TEXT = 200
+# A path or a program name is kept up to this many characters.
+MAX_NAME = 300
+names_cut = 0  # how many were longer, in this process
 _MAX_WAITING = 1000
 _MAX_TRACE_NOTES = 20
 _MAX_GAPS = 200
@@ -318,7 +321,11 @@ def _name(value: object) -> str | None:
             return None
     else:
         return None
-    return text[:300]
+    if len(text) > MAX_NAME:
+        global names_cut
+        names_cut += 1
+        return text[:MAX_NAME]
+    return text
 
 
 def _file_name(obj: object) -> str | None:
@@ -588,6 +595,15 @@ class IoRecorder:
                     f"{kinds})",
                     "no frame of user code was waiting for them, so they are "
                     "not recorded",
+                )
+            )
+        if names_cut:
+            notes.append(
+                (
+                    f"io: the end of {_plural(names_cut, 'name')} longer than "
+                    f"{MAX_NAME} characters",
+                    f"a path or a program name is kept up to {MAX_NAME} "
+                    f"characters; {_times(names_cut)} a longer one was cut there",
                 )
             )
         return notes

@@ -52,8 +52,10 @@ def test_big_containers_are_sampled() -> None:
     assert shape(list(range(1000))) == {
         "type": "list",
         "len": 1000,
+        "sampled": 50,  # `items` is about the first 50 only
         "items": {"int": 50},
     }
+    assert "sampled" not in shape(list(range(50)))
 
 
 def test_objects_are_named_by_type_and_never_run() -> None:

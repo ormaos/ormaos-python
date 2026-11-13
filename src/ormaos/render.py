@@ -22,6 +22,8 @@ def shape_text(shape: Any) -> str:
     kinds = shape.get("items")
     if isinstance(kinds, dict) and len(kinds) == 1:
         inner += f" {next(iter(kinds))}"
+        if shape.get("sampled"):
+            inner += f" in the first {shape['sampled']}"
     return f"{name}[{inner}]"
 
 
