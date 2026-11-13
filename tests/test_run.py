@@ -123,7 +123,7 @@ def test_exit_code_when_killed_by_a_signal(work: Workdir) -> None:
     # The process could not write its last events: it says so.
     (note,) = [n for n in recording.not_collected if "last events" in n["what"]]
     assert note["reason"].startswith(
-        "it was ended by signal 9 from outside the program before it had written"
+        "it was ended by the program (process 1) with signal 9 before it had written"
     )
     assert not recording.complete
 

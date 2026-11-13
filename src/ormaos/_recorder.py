@@ -38,6 +38,8 @@ _DISABLE: Any = _mon.DISABLE
 _get_traceback = BaseException.__dict__["__traceback__"].__get__
 _get_args = BaseException.__dict__["args"].__get__
 
+# Before 3.13, `frame.f_locals` of a function is a dict copied from the frame.
+_LOCALS_ARE_A_COPY = sys.version_info < (3, 13)
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 _STDLIB_DIR = os.path.dirname(os.path.abspath(os.__file__)) + os.sep
 _SITE_MARKS = (f"site-packages{os.sep}", f"dist-packages{os.sep}")
@@ -90,6 +92,18 @@ _ALWAYS_NOT_COLLECTED = [
         "reason": "the standard library and installed packages are not recorded",
     },
     {
+        "what": "code compiled from a string under another name",
+        "reason": "code made with `compile` or `exec` is the program's when its "
+        "file name is `<string>`, `<stdin>` or a notebook cell; under any other "
+        "made-up name it is not recorded",
+    },
+    {
+        "what": "code of the program that runs in the middle of the recorder",
+        "reason": "a signal handler, a `__del__` or a weak reference callback "
+        "that Python runs while Ormaos is noting an event is not recorded "
+        "(Python reports no events then)",
+    },
+    {
         "what": "exceptions that never pass through user code",
         "reason": "only exceptions seen in a user-code frame are recorded",
     },
@@ -116,7 +130,16 @@ _OPEN_CALL_KEYS = ("k", "id", "parent", "fn", "file", "line", "thread", "t", "ar
 class _Flight:
     """One exception, from the first time we see it until it is handled."""
 
-    __slots__ = ("during", "frame", "key", "rec", "seen", "unwound", "written")
+    __slots__ = (
+        "back",
+        "during",
+        "frame",
+        "key",
+        "rec",
+        "seen",
+        "unwound",
+        "written",
+    )
 
     def __init__(self, key: int, rec: dict[str, Any]) -> None:
         self.key = key  # id() of the exception object
@@ -124,6 +147,7 @@ class _Flight:
         self.unwound = 0  # id() of the last frame it left, 0 if none yet
         self.frame = 0  # id() of the frame whose handler caught it
         self.seen = 0  # id() of the frame it was last raised in
+        self.back = 0  # id() of the caller of the last frame it left
         self.during: _Flight | None = None  # the exception being handled
         self.written = 0  # in the last checkpoint: 1 as in flight, 2 as handled
 
@@ -284,6 +308,15 @@ def _handler_line(code: CodeType, offset: int, fallback: int) -> int:
     return fallback
 
 
+def _plain_attribute(obj: object, name: str) -> object:
+    """An attribute kept in the object's own dict: no property, no
+    `__getattr__` of the program is run to read it."""
+    try:
+        return object.__getattribute__(obj, "__dict__").get(name)
+    except Exception:
+        return None
+
+
 class Recorder:
     def __init__(
         self,
@@ -294,7 +327,9 @@ class Recorder:
     ) -> None:
         self._dir = directory
         self._started_by = started_by
-        self._lock = _thread.allocate_lock()
+        # Re-entrant: a signal handler of the program can run in the middle of
+        # a write and make calls of its own, on the same thread.
+        self._lock = _thread.RLock()
         self._buf: list[dict[str, Any]] = []
         self._fd = -1
         self._tool = -1
@@ -313,6 +348,9 @@ class Recorder:
         self._cells_noted = False
         self._exits_seen: set[tuple[int, int]] = set()
         self._finishing = False
+        self._failure: dict[str, Any] | None = None
+        self._at_limit = 0
+        self._mask = 0
         # asyncio tasks: id(task) -> the number we gave it. A weak reference
         # forgets the task when it is gone, so a reused id() gets a new number.
         self._aio: Any = None
@@ -320,6 +358,10 @@ class Recorder:
         self._task_refs: dict[int, Any] = {}
         self._ntasks = 0
         self._user_files: dict[str, bool] = {}
+        # One state per thread, kept in a thread-local so that a new thread
+        # never gets the state (and the number) of one that has ended, even
+        # when it gets the same identifier.
+        self._tls = _thread._local()
         self._threads: dict[int, _ThreadState] = {}
         self._suspended: dict[int, _Entry] = {}
         self._active: dict[int, _Flight] = {}
@@ -388,6 +430,7 @@ class Recorder:
                 mask |= self._io.start(tool)
             self._install_fault()
             _mon.set_events(tool, mask)
+            self._mask = mask
         except Exception as err:
             self._fail(err)
 
@@ -508,7 +551,8 @@ class Recorder:
         if self._dead or self._finished:
             return
         try:
-            self._lock = _thread.allocate_lock()
+            self._lock = _thread.RLock()
+            self._tls = _thread._local()
             self._buf = []
             self._threads = {}
             self._suspended = {}
@@ -546,6 +590,7 @@ class Recorder:
         if ACTIVE is self:
             ACTIVE = None
         try:
+            self._tool_check()
             self._stop()
         except Exception:
             pass
@@ -558,6 +603,20 @@ class Recorder:
                 self._finish_records()
         except Exception as err:
             self._fail(err)
+        if self._failure is not None:
+            self._buf.append(self._failure)  # it could not be written then
+            self._failure = None
+        if self._at_limit:
+            self._buf.append(
+                {
+                    "k": "not_collected",
+                    "what": "events at the recursion limit",
+                    "reason": f"{self._at_limit} times the program was at its "
+                    "recursion limit when an event arrived, and the recorder had "
+                    "no room to note it: calls and exceptions around that point "
+                    "can be missing, or be shown without their end",
+                }
+            )
         try:
             lines = [json.dumps(rec, separators=(",", ":")) for rec in self._buf]
             self._buf = []
@@ -576,6 +635,27 @@ class Recorder:
                 self._fd = -1
         except Exception:
             pass
+
+    def _tool_check(self) -> None:
+        """Did the program change the events of our monitoring tool?"""
+        tool = self._tool
+        if tool < 0 or self._dead:
+            return
+        try:
+            now = _mon.get_events(tool)
+        except Exception:
+            now = -1
+        if now != self._mask:
+            self._buf.append(
+                {
+                    "k": "not_collected",
+                    "what": "what ran after the program changed the monitoring tool",
+                    "reason": f"Ormaos records through sys.monitoring tool {tool}; "
+                    "when the process ended, the events of that tool were not the "
+                    "ones Ormaos had set (the program set, cleared or freed them), "
+                    "so calls and exceptions after that change are missing",
+                }
+            )
 
     def block_left(self, exc: BaseException) -> None:
         """An exception is leaving a `with ormaos.record():` block. The `with`
@@ -651,8 +731,11 @@ class Recorder:
 
     def _emit(self, rec: dict[str, Any], now_too: bool = False) -> None:
         with self._lock:
+            before = self._owner
             self._owner = _thread.get_ident()
             try:
+                if self._dead and not self._finishing:
+                    return  # recording has stopped
                 self._buf.append(rec)
                 if self._finishing:
                     return  # `finish` writes everything at once
@@ -668,10 +751,11 @@ class Recorder:
                     buf.append(self._checkpoint(now))
                     self._write(buf)
             finally:
-                self._owner = 0
+                self._owner = before
 
     def _flush(self) -> None:
         with self._lock:
+            before = self._owner
             self._owner = _thread.get_ident()
             try:
                 if self._buf:
@@ -679,13 +763,14 @@ class Recorder:
                     self._buf = []
                     self._write(buf)
             finally:
-                self._owner = 0
+                self._owner = before
 
     def _flush_now(self) -> None:
         """Write what waits, and a checkpoint, without a new record."""
         if self._finishing:
             return
         with self._lock:
+            before = self._owner
             self._owner = _thread.get_ident()
             try:
                 now = time.perf_counter_ns()
@@ -695,7 +780,7 @@ class Recorder:
                 buf.append(self._checkpoint(now))
                 self._write(buf)
             finally:
-                self._owner = 0
+                self._owner = before
 
     def _checkpoint(self, now: int) -> dict[str, Any]:
         """What is still open when a chunk is written: the calls that have
@@ -751,36 +836,77 @@ class Recorder:
         self._emit({"k": "not_collected", "what": what, "reason": reason}, True)
 
     def _fail(self, err: BaseException) -> None:
-        """Internal error: stop recording, keep the program running."""
+        """An exception reached one of our callbacks. If it is the program's
+        own (raised by a signal handler that ran in the middle of a callback),
+        it goes on to the program. Otherwise it is an internal error: stop
+        recording, keep the program running."""
+        if self._is_the_programs(err):
+            raise err
+        if isinstance(err, RecursionError):
+            # The program is at its recursion limit and our callback had no
+            # room left. That one event is not noted; recording goes on, and
+            # the recording says how often this happened.
+            self._at_limit += 1
+            return
         if self._dead:
             return
         self._dead = True
+        where = "?"
         try:
-            self._stop()
-        except Exception:
-            pass
-        try:
-            where = "?"
             tb = err.__traceback__
             if tb is not None:
                 while tb.tb_next is not None:
                     tb = tb.tb_next
                 name = os.path.basename(tb.tb_frame.f_code.co_filename)
                 where = f"{name}:{tb.tb_lineno}"
-            note = {
-                "k": "not_collected",
-                "what": "everything after this point",
-                "reason": (
-                    f"internal error in ormaos ({type(err).__name__} at {where}); "
-                    "recording stopped, the program was not affected"
-                ),
-            }
-            # Bypass the test hook on purpose: say why, if the file still works.
-            buf, self._buf = self._buf, []
-            lines = [json.dumps(rec, separators=(",", ":")) for rec in [*buf, note]]
-            Recorder._write_out(self, ("\n".join(lines) + "\n").encode("utf-8"))
-        except Exception:
+        except BaseException:
             pass
+        kind = type(err).__name__
+        extra = ""
+        # Kept, and written when the process ends, if it cannot be written
+        # now (at the recursion limit there is no room to do anything).
+        self._failure = {
+            "k": "not_collected",
+            "what": "everything after this point",
+            "reason": (
+                f"internal error in ormaos ({kind} at {where}){extra}; "
+                "recording stopped, the program was not affected"
+            ),
+        }
+        try:
+            self._stop()
+        except BaseException:
+            pass
+        try:
+            # Bypass the test hook on purpose: say why, if the file still works.
+            buf = [*self._buf, self._failure]
+            lines = [json.dumps(rec, separators=(",", ":")) for rec in buf]
+            Recorder._write_out(self, ("\n".join(lines) + "\n").encode("utf-8"))
+            self._buf = []
+            self._failure = None
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _is_the_programs(err: BaseException) -> bool:
+        """Did code of the program raise this while one of our callbacks was
+        running? We never call the program's code, so a frame that is neither
+        ours nor the standard library's, below one of ours, is a signal
+        handler of the program (or another function Python ran between two of
+        our instructions)."""
+        try:
+            tb = err.__traceback__
+            ours = False
+            while tb is not None:
+                name = tb.tb_frame.f_code.co_filename
+                if name.startswith(_PACKAGE_DIR):
+                    ours = True
+                elif ours and not name.startswith((_STDLIB_DIR, "<frozen")):
+                    return True
+                tb = tb.tb_next
+        except BaseException:
+            pass
+        return False
 
     # ------------------------------------------------------------- helpers
 
@@ -882,10 +1008,11 @@ class Recorder:
         return forget
 
     def _thread_state(self) -> _ThreadState:
-        ident = _thread.get_ident()
-        state = self._threads.get(ident)
-        if state is None:
-            state = self._threads[ident] = _ThreadState(len(self._threads) + 1)
+        try:
+            state: _ThreadState = self._tls.state
+        except AttributeError:
+            index = len(self._threads) + 1
+            state = self._tls.state = self._threads[index] = _ThreadState(index)
         return state
 
     @staticmethod
@@ -942,12 +1069,29 @@ class Recorder:
         for name in code.co_varnames[:count]:
             if name in local:
                 out[name] = shape(local[name])
+        if _LOCALS_ARE_A_COPY:
+            # Python 3.12 keeps this dict on the frame, and with it every
+            # argument, until the frame ends: emptied, so that an argument is
+            # released when the program drops it. (A function frame's dict is
+            # filled again whenever something asks for the locals.)
+            local.clear()
         return out
 
     def _pop(self, code: CodeType) -> _Entry | None:
         stack = self._thread_state().stack
         if stack and stack[-1][0] is code:
             return stack.pop()
+        if self._at_limit and stack:
+            # The end of some calls was missed at the recursion limit: they
+            # are still on top of this one. They are written as they are.
+            for depth in range(len(stack) - 1, -1, -1):
+                if stack[depth][0] is code:
+                    for _code, rec in stack[depth + 1 :]:
+                        if rec is not None:
+                            rec["out"] = "end not seen"
+                            self._emit(rec)
+                    del stack[depth + 1 :]
+                    return stack.pop()
         return None
 
     def _close(self, code: CodeType, out: str, ret: object) -> None:
@@ -1062,8 +1206,10 @@ class Recorder:
         try:
             flight = self._active.get(id(exc))
             if flight is not None:
-                frame_id = id(sys._getframe(1))
+                frame = sys._getframe(1)
+                frame_id = id(frame)
                 flight.unwound = frame_id
+                flight.back = id(frame.f_back)
                 handled = flight.during
                 if handled is not None and handled.frame == frame_id:
                     # It left the frame whose handler was running: the
@@ -1138,12 +1284,32 @@ class Recorder:
             flight = self._active.get(key)
             if flight is not None:
                 if not flight.unwound:
+                    frame_id = id(sys._getframe(1))
+                    if flight.seen != frame_id and flight.rec["type"] == type_name(
+                        type(exc)
+                    ):
+                        return
+                    # Raised again in the frame it was last raised in, with no
+                    # handler and no unwinding in between, or another type:
+                    # this is a new exception with the id() of one that the
+                    # interpreter took without a handler (see `_absorbed`).
+                    del self._active[key]
+                    self._taken(flight, code)
+                    if self._user(code):
+                        self._begin(code, sys._getframe(1), exc, key)
                     return
                 tb = _get_traceback(exc)
                 below = tb.tb_next if tb is not None else None
-                if below is not None and id(below.tb_frame) == flight.unwound:
-                    flight.unwound = 0  # the same exception, one frame up
-                    flight.seen = id(sys._getframe(1))
+                here = id(sys._getframe(1))
+                # The same exception, one frame up: its traceback says so, or
+                # (a bare `raise` in a helper and a `StopIteration` out of
+                # `__next__` add no traceback entry) it is raised in the
+                # caller of the frame it just left, with the same type.
+                if (below is not None and id(below.tb_frame) == flight.unwound) or (
+                    flight.back == here and flight.rec["type"] == type_name(type(exc))
+                ):
+                    flight.unwound = 0
+                    flight.seen = here
                     return
                 # A new exception object that got the id() of an old one. The
                 # old one left Python frames and no handler was reported.
@@ -1172,9 +1338,8 @@ class Recorder:
         """This process has just learned how a child it started ended
         (`multiprocessing` or `subprocess` waited for it). Written when a
         signal ended the child: the child itself could not say so."""
-        child = frame.f_locals.get("self")
-        pid = getattr(child, "pid", None)
-        code = getattr(child, "returncode", None)
+        pid = _plain_attribute(frame.f_locals.get("self"), "pid")
+        code = _plain_attribute(frame.f_locals.get("self"), "returncode")
         if type(pid) is not int or type(code) is not int or code >= 0:
             return
         if (pid, code) in self._exits_seen:
@@ -1195,7 +1360,7 @@ class Recorder:
         (`multiprocessing` or `subprocess`: terminate, kill, the end of a
         pool). Written at once: the child may write no end record."""
         local = frame.f_locals
-        pid = getattr(local.get("self"), "pid", None)
+        pid = _plain_attribute(local.get("self"), "pid")
         signum = local.get("sig")
         if type(pid) is not int or not isinstance(signum, int):
             return
@@ -1227,16 +1392,19 @@ class Recorder:
         for flight in list(self._active.values()):
             if flight.seen == frame_id and not flight.unwound:
                 del self._active[flight.key]
-                flags = code.co_flags
-                if flags & 0x380:  # coroutine, iterable coroutine, async generator
-                    how = "await"
-                elif flags & 0x20:  # generator
-                    how = "yield from"
-                else:
-                    how = "other"
-                flight.rec["end"] = "taken_by_interpreter"
-                flight.rec["how"] = how
-                self._emit(flight.rec)
+                self._taken(flight, code)
+
+    def _taken(self, flight: _Flight, code: CodeType) -> None:
+        flags = code.co_flags
+        if flags & 0x380:  # coroutine, iterable coroutine, async generator
+            how = "await"
+        elif flags & 0x20:  # generator
+            how = "yield from"
+        else:
+            how = "other"
+        flight.rec["end"] = "taken_by_interpreter"
+        flight.rec["how"] = how
+        self._emit(flight.rec)
 
     def _begin(
         self, code: CodeType, frame: FrameType, exc: BaseException, key: int
@@ -1289,11 +1457,26 @@ class Recorder:
             file, line, fn = code.co_filename, frame.f_lineno, code.co_qualname
             user = True
         else:
-            while tb.tb_next is not None:
+            # The deepest entry; but when the exception arrived while one of
+            # our callbacks was running (a KeyboardInterrupt), the place in
+            # the program where that callback was running.
+            before_us = None
+            last = tb
+            while tb is not None:
+                if before_us is None and tb.tb_next is not None:
+                    below = tb.tb_next.tb_frame.f_code.co_filename
+                    if below.startswith(_PACKAGE_DIR):
+                        before_us = tb
+                last = tb
                 tb = tb.tb_next
-            origin = tb.tb_frame.f_code
-            file, line, fn = origin.co_filename, tb.tb_lineno, origin.co_qualname
-            user = self._user_at(file, tb.tb_frame)
+            deepest = last.tb_frame.f_code.co_filename
+            if before_us is not None and deepest.startswith(
+                (_PACKAGE_DIR, _STDLIB_DIR, "<frozen")
+            ):
+                last = before_us
+            origin = last.tb_frame.f_code
+            file, line, fn = origin.co_filename, last.tb_lineno, origin.co_qualname
+            user = self._user_at(file, last.tb_frame)
         return {"file": file, "line": line, "fn": fn, "user": user}
 
     def _exception_handled(

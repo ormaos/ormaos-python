@@ -338,6 +338,30 @@ def _file_name(obj: object) -> str | None:
         return None  # a closed or detached file
 
 
+def _set_trace_callback(conn: Any, callback: object) -> None:
+    sys.modules["sqlite3"].Connection.set_trace_callback(conn, callback)
+
+
+def _request_target(raw: bytes) -> str:
+    """The target of a request line as it is recorded: the path. Not the
+    user name and password of an absolute URL, not the `;parameters` of a
+    path segment, not the fragment."""
+    text = raw.decode("utf-8", "replace")
+    for mark in ("#", ";"):
+        cut = text.find(mark)
+        if cut >= 0:
+            text = text[:cut]
+    scheme = text.find("://")
+    if scheme >= 0:
+        host_end = text.find("/", scheme + 3)
+        host = text[scheme + 3 :] if host_end < 0 else text[scheme + 3 : host_end]
+        at = host.rfind("@")
+        if at >= 0:
+            rest = "" if host_end < 0 else text[host_end:]
+            text = text[: scheme + 3] + host[at + 1 :] + rest
+    return text[:_MAX_TEXT]
+
+
 def _program(value: object) -> str:
     text = _name(value)
     return os.path.basename(text) if text else "?"
@@ -440,6 +464,7 @@ class IoRecorder:
             "os.exec": self._exec,
             "os.posix_spawn": self._exec,
             "os.fork": self._fork,
+            "os.kill": self._kill,
             "http.client.send": self._http_send,
             "socket.connect": self._socket,
             "socket.bind": self._socket,
@@ -887,7 +912,9 @@ class IoRecorder:
         tracer = _Tracer(self, db, target)
         try:
             before = gc.get_referents(conn)
-            conn.set_trace_callback(tracer)
+            # The method of sqlite3 itself: a subclass of the program may
+            # have its own, and that is not ours to call.
+            _set_trace_callback(conn, tracer)
             after = gc.get_referents(conn)
         except Exception as err:
             self._rec._note(
@@ -956,6 +983,26 @@ class IoRecorder:
         }
         self._new("subprocess", "exec", frame, fields)
 
+    def _kill(self, args: Any, frame: FrameType) -> None:
+        """The program sends a signal with `os.kill`: noted, so that a process
+        of the recording that it ends is not said to be ended from outside."""
+        pid, signum = args[0], args[1]
+        sender = frame.f_code.co_filename
+        if sender.endswith(("popen_fork.py", _SUBPROCESS)):
+            return  # already noted, with who asked for it
+        if type(pid) is int and isinstance(signum, int) and signum:
+            recorder = self._rec
+            recorder._emit(
+                {
+                    "k": "child_ended",
+                    "pid": pid,
+                    "signal": int(signum),
+                    "by": "program",
+                    "t": time.perf_counter_ns() - recorder._t0,
+                },
+                True,
+            )
+
     def _fork(self, args: Any, frame: FrameType) -> None:
         if frame.f_code.co_filename.endswith(_SUBPROCESS):
             return
@@ -1002,9 +1049,7 @@ class IoRecorder:
             "scheme": "https" if secure else "http",
             "host": host if type(host) is str else None,
             "port": port if type(port) is int else None,
-            "target": (raw if query < 0 else raw[:query]).decode("utf-8", "replace")[
-                :_MAX_TEXT
-            ],
+            "target": _request_target(raw if query < 0 else raw[:query]),
             "query": query >= 0,
         }
         method = parts[0].decode("ascii", "replace")[:16]

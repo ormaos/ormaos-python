@@ -13,8 +13,11 @@ _SAMPLE = 50
 _get_module = type.__dict__["__module__"].__get__
 _get_qualname = type.__dict__["__qualname__"].__get__
 
-_SIZED = (str, bytes, bytearray)
-_SEQUENCES = (list, tuple, set, frozenset)
+# Compared by identity (`id`), never with `==` or `hash`: both would run the
+# code of a metaclass of the program.
+_SIZED = frozenset(map(id, (str, bytes, bytearray)))
+_SEQUENCES = frozenset(map(id, (list, tuple, set, frozenset)))
+_get_name = type.__dict__["__name__"].__get__
 
 
 def type_name(tp: type) -> str:
@@ -41,11 +44,12 @@ def shape(value: object) -> dict[str, Any]:
     """The shape of ``value``: its type, and for builtin containers the length
     and the types of the first items. Never any content."""
     tp = type(value)
-    if tp in _SIZED:
-        return {"type": tp.__name__, "len": len(value)}  # type: ignore[arg-type]
-    if tp in _SEQUENCES:
+    key = id(tp)
+    if key in _SIZED:
+        return {"type": _get_name(tp), "len": len(value)}  # type: ignore[arg-type]
+    if key in _SEQUENCES:
         size = len(value)  # type: ignore[arg-type]
-        out: dict[str, Any] = {"type": tp.__name__, "len": size}
+        out: dict[str, Any] = {"type": _get_name(tp), "len": size}
         if size:
             try:
                 out["items"] = _kinds(value)

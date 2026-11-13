@@ -116,7 +116,7 @@ def test_multiprocessing_children_are_recorded_and_linked(
 
 
 ENDS = """\
-import multiprocessing as mp, os, signal, sys, time
+import multiprocessing as mp, os, signal, subprocess, sys, time
 
 def quick(n):
     return n + 1
@@ -151,8 +151,11 @@ if __name__ == "__main__":
             child.terminate()
         elif case == "kill":
             child.kill()
-        else:
+        elif case == "os.kill":
             os.kill(child.pid, signal.SIGKILL)
+        else:
+            # Another program sends the signal: the recorded one does not.
+            subprocess.run(["kill", "-9", str(child.pid)], check=True)
         child.join()
         print("exit", child.exitcode)
 """
@@ -253,7 +256,14 @@ def test_a_pool_ended_in_the_middle_of_a_task_is_incomplete(
             "was ended by the program (process 1) with signal 15",
         ),
         ("kill", 9, "program", "was ended by the program (process 1) with signal 9"),
-        ("outside", 9, "outside", "was ended by signal 9 from outside the program"),
+        (
+            "outside",
+            9,
+            "outside",
+            "was ended by signal 9, which the program was not seen sending "
+            "(from outside, or by a way that is not watched)",
+        ),
+        ("os.kill", 9, "program", "was ended by the program (process 1) with signal 9"),
     ],
 )
 @pytest.mark.parametrize("method", ["fork", "spawn"])

@@ -26,13 +26,6 @@ ENVIRONMENT_NOTE = {
 }
 
 
-def _say(message: str) -> None:
-    try:
-        print("ormaos: " + message, file=sys.stderr, flush=True)
-    except Exception:
-        pass
-
-
 class Session:
     """What ``ormaos.record()`` returns. After the block starts, ``name`` is
     the recording (``r3``) and ``directory`` its folder; both are ``None``
@@ -160,5 +153,6 @@ class Session:
                 for line in summarize(load(self.directory), self._cwd):
                     print(line, file=sys.stderr)
         except Exception as err:
-            _say(f"could not finish the recording ({type(err).__name__})")
+            # Nothing is printed: the block is inside someone's program.
+            self.reason = f"could not finish the recording ({type(err).__name__})"
         return False

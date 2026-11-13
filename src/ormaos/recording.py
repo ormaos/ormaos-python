@@ -29,7 +29,7 @@ from typing import Any
 FORMAT = "provisional-0"
 ROOT = ".ormaos"
 
-_DIR_NAME = re.compile(r"r(\d+)")
+_DIR_NAME = re.compile(r"r([1-9]\d*)")
 
 type Record = dict[str, Any]
 
@@ -69,7 +69,10 @@ class Process:
                 f"with signal {signum}"
             )
         if by == "outside":
-            return f"was ended by signal {signum} from outside the program"
+            return (
+                f"was ended by signal {signum}, which the program was not seen "
+                "sending (from outside, or by a way that is not watched)"
+            )
         return "has no end record and no signal was seen (it may still be running)"
 
     written_until: int | None = None  # `t` of the last checkpoint
@@ -148,7 +151,7 @@ def _read_lines(path: str) -> tuple[list[Record], int]:
                 continue
             try:
                 value = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 bad += 1
                 continue
             if isinstance(value, dict):
@@ -200,6 +203,30 @@ def _from_checkpoints(proc: Process, checkpoints: list[Record]) -> None:
         proc.exceptions.append(exc)
 
 
+def _well_formed(rec: Record) -> bool:
+    """Has a call, exception or io record the parts the readers rely on? A
+    file can be damaged or written by something else."""
+    if type(rec.get("id")) is not int:
+        return False
+    for key in ("t", "dur", "line", "n", "thread"):
+        if key in rec and type(rec[key]) is not int:
+            return False
+    kind = rec["k"]
+    if kind == "call":
+        parent = rec.get("parent")
+        if parent is not None and (type(parent) is not int or parent >= rec["id"]):
+            return False  # a parent starts before its calls
+        if not isinstance(rec.get("args", {}), dict):
+            return False
+        return "path" not in rec or isinstance(rec["path"], list)
+    if kind == "exc":
+        for key in ("origin", "at", "handled"):
+            if key in rec and not isinstance(rec[key], dict):
+                return False
+        return isinstance(rec.get("origin"), dict)
+    return True
+
+
 def _note(what: str, reason: str) -> Record:
     return {"k": "not_collected", "what": what, "reason": reason}
 
@@ -222,6 +249,9 @@ def _load_process(path: str) -> Process:
     for rec in records:
         kind = rec.get("k")
         clean = kind == "checkpoint" and rec.get("idle") is True
+        if kind in ("call", "exc", "io") and not _well_formed(rec):
+            bad += 1  # valid JSON, but not a record this version writes
+            continue
         if kind == "call":
             proc.calls.append(rec)
         elif kind == "exc":
@@ -245,7 +275,11 @@ def _load_process(path: str) -> Process:
         _from_checkpoints(proc, checkpoints)
     if bad:
         proc.not_collected.append(
-            _note(f"{bad} lines of {name}", "the lines are not valid JSON")
+            _note(
+                f"{bad} lines of {name}",
+                "the lines are not valid JSON, or not records in the form this "
+                "version writes",
+            )
         )
     proc.calls.sort(key=lambda rec: rec.get("id", 0))
     proc.exceptions.sort(key=lambda rec: rec.get("id", 0))
@@ -415,7 +449,12 @@ def load(path: str) -> Recording:
         recording.not_collected.extend(proc.not_collected)
     recording.processes = processes
     scopes = sorted(
-        {str(s) for proc in processes for s in proc.header.get("path_scope", [])}
+        {
+            str(s)
+            for proc in processes
+            if isinstance(proc.header.get("path_scope"), list)
+            for s in proc.header["path_scope"]
+        }
     )
     if scopes and not any("path" in call for call in recording.calls):
         recording.not_collected.append(

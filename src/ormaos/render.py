@@ -295,7 +295,12 @@ def _show(doc: Doc) -> list[str]:
         for proc in processes:
             parent = proc.get("parent_process")
             how = "forked from" if proc.get("forked") else "started by"
-            origin = f"{how} process {parent}" if parent else "the first"
+            if parent:
+                origin = f"{how} process {parent}"
+            elif proc["process"] == 1:
+                origin = "the first"
+            else:
+                origin = "started by a process that is not in the recording"
             if proc.get("complete"):
                 end = ""
             else:
@@ -336,7 +341,7 @@ def _show(doc: Doc) -> list[str]:
         lines.append(f"not collected: {note['what']}: {note['reason']}")
     always = len(doc["not_collected"]) - len(specific)
     lines.append(
-        f"never recorded: values, and {always - 1} more kinds of things "
+        f"never recorded: values, and {max(0, always - 1)} more kinds of things "
         "(`ormaos show --json` lists them with the reason)"
     )
     return lines
@@ -591,6 +596,13 @@ def _list_line(entry: Doc) -> str:
     return "  ".join(parts)
 
 
+def _unreadable(doc: Doc) -> list[str]:
+    return [
+        f"{entry['recording']}  cannot be read ({entry['reason']})"
+        for entry in doc.get("unreadable", [])
+    ]
+
+
 def _list(doc: Doc) -> list[str]:
     if not doc["total"]:
         return [f"no recordings in {doc['root']}"]
@@ -600,7 +612,7 @@ def _list(doc: Doc) -> list[str]:
         + (f" (showing {len(shown)})" if len(shown) < doc["total"] else "")
     ]
     lines.extend(_list_line(entry) for entry in shown)
-    return lines
+    return lines + _unreadable(doc)
 
 
 def _status(doc: Doc) -> list[str]:
@@ -610,7 +622,9 @@ def _status(doc: Doc) -> list[str]:
     lines.append(f"this Python can record: {can}; starts by itself under `run`: {auto}")
     now = doc.get("recording_now")
     lines.append(
-        f"this process is being recorded: {now}" if now else "not being recorded now"
+        f"this command is running inside a recording: {now}"
+        if now
+        else "this command is not running inside a recording"
     )
     if not doc["recordings"]:
         lines.append(f"no recordings in {doc['root']}")
@@ -626,7 +640,7 @@ def _status(doc: Doc) -> list[str]:
         lines.append(
             "incomplete (no end record, not running): " + ", ".join(doc["incomplete"])
         )
-    return lines
+    return lines + _unreadable(doc)
 
 
 def _error(doc: Doc) -> list[str]:

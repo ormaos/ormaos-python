@@ -81,8 +81,8 @@ def test_a_killed_program_is_read_as_far_as_it_was_written(work: Workdir) -> Non
     assert doc["complete"] is False
     # `ormaos run` saw the signal that ended the command.
     assert doc["incomplete"] == [
-        "process 1 was ended by signal 9 from outside the program, "
-        "with events not written"
+        "process 1 was ended by signal 9, which the program was not seen sending "
+        "(from outside, or by a way that is not watched), with events not written"
     ]
     assert process_ended(doc) == {
         "signal": 9,
@@ -105,7 +105,8 @@ def test_a_killed_program_is_read_as_far_as_it_was_written(work: Workdir) -> Non
     lines = work.cli("show").stdout.splitlines()
     assert lines[0].startswith("r1 (incomplete) exit 137 (signal 9)")
     assert lines[1] == (
-        "incomplete: process 1 was ended by signal 9 from outside the program, "
+        "incomplete: process 1 was ended by signal 9, which the program was not "
+        "seen sending (from outside, or by a way that is not watched), "
         "with events not written: shown as far as it was written"
     )
 
