@@ -64,9 +64,9 @@ An address belongs to one recording: `r3:c42` and `r4:c42` are not the same call
 | `ormaos list` | The recordings in `.ormaos/`, newest first: when, how each ended, the counts, the command. A run that was killed or is still running is marked; it is read as far as it was written. |
 | `ormaos status` | What works here: the version, whether this Python can record, whether something is being recorded now, the last recording, the incomplete ones. |
 
-Options on every verb: `--json` (one JSON document on stdout, also for errors, with `kind`, `version`, `next` and `next_commands`). On `tree`, `exceptions`, `path` and `io`: `--limit N` and `--offset N`. On `tree`: `--depth N`. On `io`: `--kind sqlite|file|subprocess|http`.
+On every reading verb and on `guide`: `--json` (one JSON document on stdout, also for errors, with `kind`, `version`, `next` and `next_commands`); `ormaos run` has `--json-out FILE` instead. On `tree`, `exceptions`, `path`, `io` and `list`: `--limit N` and `--offset N`. On `tree`: `--depth N`. On `io`: `--kind sqlite|file|subprocess|http`.
 
-An exception is `swallowed` (it entered an `except` and was not raised again; "handled at" is the line of that `except`), `uncaught` (it ended the program), `replaced` (another one was raised from its handler) or `exit` (a `SystemExit`, as `sys.exit()` raises).
+An exception is `swallowed` (it entered an `except` and was not raised again; "handled at" is the line of that `except`), `uncaught` (it ended the program), `replaced` (another one was raised from its handler) or `exit` (a `SystemExit` that ended the program; one that the program catches is `swallowed`). The `StopIteration` that ends an `await` of a future is counted apart, as `ended at await`.
 
 `--limit N` asks for more lines. `--offset N` skips entries already seen; for `tree` these are the calls directly below the address.
 

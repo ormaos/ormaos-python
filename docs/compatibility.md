@@ -10,7 +10,7 @@ and "works, with these limits" when it has: the limits below are those notes,
 in plain words. What is never recorded, with or without these libraries
 (values, the calls inside the libraries themselves), is in the README.
 
-This file is written by `python tests/compat/matrix.py`; a test fails when it
+This file is what `python tests/compat/matrix.py` prints; a test fails when it
 is out of date.
 
 | What | Example | Recorded with | In the recording | Result |

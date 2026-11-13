@@ -46,7 +46,7 @@ ends with `next:`, the commands for the next question.
 An exception address given to tree, io or path means the call that handled it.
 Exceptions are: "swallowed" (entered an `except`, not raised again; "handled
 at" is the line of that `except`), "uncaught" (ended the program), "replaced"
-(another was raised from its handler), "exit" (a SystemExit, as sys.exit()).
+(another was raised from its handler), "exit" (SystemExit ended the program).
 Options: --json (one JSON document, also for errors), --limit N, --offset N
 (skip entries); tree: --depth N; io: --kind sqlite|file|subprocess|http.
 
