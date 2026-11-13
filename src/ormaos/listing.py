@@ -57,10 +57,23 @@ def _entry(recording: Recording) -> dict[str, Any]:
     }
 
 
+def _try_entry(root: str, number: int) -> dict[str, Any]:
+    """One recording of the list; one that cannot be read does not hide the
+    others."""
+    try:
+        return _entry(load(os.path.join(root, f"r{number}")))
+    except Exception as err:
+        return {"recording": f"r{number}", "reason": type(err).__name__}
+
+
 def list_document(limit: int, offset: int, root: str = ROOT) -> dict[str, Any]:
     numbers = recording_numbers(root)[::-1]
     shown = numbers[offset : offset + limit]
-    entries = [_entry(load(os.path.join(root, f"r{number}"))) for number in shown]
+    entries: list[dict[str, Any]] = []
+    unreadable: list[dict[str, Any]] = []
+    for number in shown:
+        entry = _try_entry(root, number)
+        (unreadable if "reason" in entry else entries).append(entry)
     commands = [f"ormaos show {entry['recording']}" for entry in entries[:3]]
     rest = len(numbers) - offset - len(shown)
     if rest > 0:
@@ -80,6 +93,7 @@ def list_document(limit: int, offset: int, root: str = ROOT) -> dict[str, Any]:
         "offset": offset,
         "not_shown": max(0, rest),
         "recordings": entries,
+        "unreadable": unreadable,
         "next": [entry["recording"] for entry in entries[:3]],
         "next_commands": commands,
     }
@@ -95,8 +109,12 @@ def status_document(root: str = ROOT) -> dict[str, Any]:
     running: list[str] = []
     incomplete: list[str] = []
     last: dict[str, Any] | None = None
+    unreadable: list[dict[str, Any]] = []
     for number in numbers[::-1][:STATUS_LOOKS_AT]:
-        entry = _entry(load(os.path.join(root, f"r{number}")))
+        entry = _try_entry(root, number)
+        if "reason" in entry:
+            unreadable.append(entry)
+            continue
         if last is None:
             last = entry
         if entry["running"]:
@@ -124,6 +142,7 @@ def status_document(root: str = ROOT) -> dict[str, Any]:
         "last": last,
         "running": running,
         "incomplete": incomplete,
+        "unreadable": unreadable,
         "next": [last["recording"]] if last is not None else [],
         "next_commands": commands,
     }

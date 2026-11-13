@@ -15,10 +15,18 @@ _ADDRESS_HELP = (
 )
 
 
+_RECORDING_HELP = "`last` (the default), or a recording such as r3"
+
+
 class _Parser(argparse.ArgumentParser):
-    """With ``--json`` on the command line, usage errors are JSON too."""
+    """With ``--json`` on the command line, usage errors are JSON too. An
+    option must be written in full: `--json` is never read as `--json-out`."""
 
     argv: Sequence[str] = ()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
 
     def error(self, message: str) -> NoReturn:
         if "--json" in _Parser.argv:
@@ -50,7 +58,12 @@ def _reader(
     verb: argparse.ArgumentParser = commands.add_parser(
         name, help=summary, description=description
     )
-    verb.add_argument("address", nargs="?", default="last", help=_ADDRESS_HELP)
+    verb.add_argument(
+        "address",
+        nargs="?",
+        default="last",
+        help=_RECORDING_HELP if name == "show" else _ADDRESS_HELP,
+    )
     verb.add_argument("--json", action="store_true", help="print JSON on stdout")
     if limit is not None:
         verb.add_argument(
@@ -310,6 +323,17 @@ def _answer(build: Callable[[], dict[str, Any]], as_json: bool) -> int:
     except OSError as err:
         doc, code = (
             error_document(f"cannot read the recording ({type(err).__name__})"),
+            1,
+        )
+    except Exception as err:
+        # A recording that something else wrote or damaged: said, never a
+        # traceback.
+        doc, code = (
+            error_document(
+                "cannot read the recording: a record in it is not in the form "
+                f"this version writes ({type(err).__name__})",
+                ["ormaos list"],
+            ),
             1,
         )
     if as_json:

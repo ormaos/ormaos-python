@@ -91,7 +91,7 @@ def test_status(work: Workdir) -> None:
     assert result.stdout.splitlines() == [
         f"ormaos {__version__} on Python {version} ({sys.executable})",
         "this Python can record: yes; starts by itself under `run`: yes",
-        "not being recorded now",
+        "this command is not running inside a recording",
         "no recordings in .ormaos",
         "next: ormaos run -- <command> | ormaos guide",
     ]
