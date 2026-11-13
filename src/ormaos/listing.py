@@ -50,10 +50,10 @@ def _entry(recording: Recording) -> dict[str, Any]:
         "complete": recording.complete,
         "running": recording.end is None and _alive(header.get("pid")),
         "processes": len(recording.processes),
-        "calls": len(recording.calls),
+        "calls": recording.n_calls,
         "exceptions": len(exceptions),
         "swallowed": sum(1 for exc in exceptions if exc.get("swallowed")),
-        "io": sum(int(event.get("n", 1)) for event in recording.io),
+        "io": sum(recording.io_counts.values()),
     }
 
 
@@ -61,7 +61,7 @@ def _try_entry(root: str, number: int) -> dict[str, Any]:
     """One recording of the list; one that cannot be read does not hide the
     others."""
     try:
-        return _entry(load(os.path.join(root, f"r{number}")))
+        return _entry(load(os.path.join(root, f"r{number}"), overview=True))
     except Exception as err:
         return {"recording": f"r{number}", "reason": type(err).__name__}
 

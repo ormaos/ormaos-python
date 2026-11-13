@@ -63,12 +63,12 @@ def _first_line(recording: Recording) -> str:
         _plural(len(recording.processes), "Python process").replace(
             "processs", "processes"
         ),
-        _plural(len(recording.calls), "call"),
+        _plural(recording.n_calls, "call"),
         _plural(len(exceptions), "exception"),
     ]
     inside = [f"{swallowed} swallowed", *taken_counts(exceptions)]
     tail = f" ({', '.join(inside)})" if exceptions else ""
-    events = sum(int(event.get("n", 1)) for event in recording.io)
+    events = sum(recording.io_counts.values())
     if events:
         tail += f", {events} io"
     return f"{head}: {', '.join(counts)}{tail}"
@@ -170,9 +170,9 @@ def summarize(recording: Recording, cwd: str = "") -> list[str]:
         lines.append(f"not collected: {first.get('what')}: {first.get('reason')}{more}")
 
     following = [f"ormaos exceptions {addr}" for _line, addr in highlights]
-    calls = recording.calls
-    if calls:
-        following.append(f"ormaos tree {calls[0]['addr']}")
+    first_call = recording.first_call
+    if first_call:
+        following.append(f"ormaos tree {first_call}")
     last = f"saved in {display_path(recording.path, cwd)}"
     if following:
         last += f", next: {' | '.join(following)}"

@@ -150,7 +150,8 @@ class Session:
                 from ormaos.recording import load
                 from ormaos.summary import summarize
 
-                for line in summarize(load(self.directory), self._cwd):
+                recording = load(self.directory, overview=True)
+                for line in summarize(recording, self._cwd):
                     print(line, file=sys.stderr)
         except Exception as err:
             # Nothing is printed: the block is inside someone's program.

@@ -85,10 +85,9 @@ def _process(proc: Process) -> dict[str, Any]:
         "cpu_user_s": end.get("cpu_user"),
         "cpu_system_s": end.get("cpu_system"),
         "max_rss_kb": end.get("max_rss_kb"),
-        "threads": end.get("threads")
-        or len({call.get("thread") for call in proc.calls}),
-        "tasks": len({call["task"] for call in proc.calls if "task" in call}),
-        "calls": len(proc.calls),
+        "threads": end.get("threads") or len(proc.call_threads),
+        "tasks": len(proc.call_tasks),
+        "calls": proc.n_calls,
         "exceptions": len(proc.exceptions),
     }
 
@@ -128,7 +127,7 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
     header = recording.header
     end = recording.end or {}
     exceptions = recording.exceptions
-    calls = recording.calls
+    first_call = recording.first_call
     groups = swallowed_groups(exceptions)
     uncaught = [exc for exc in exceptions if exc.get("end") == "uncaught"]
 
@@ -148,13 +147,10 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
     following = [group[0]["addr"] for group in groups[:MAX_ADDRESSES]]
     following += [exc["addr"] for exc in uncaught[:MAX_ADDRESSES]]
     commands = [f"ormaos exceptions {addr}" for addr in following]
-    if calls:
-        following.append(calls[0]["addr"])
-        commands.append(f"ormaos tree {calls[0]['addr']}")
-    io_by_kind: dict[str, int] = {}
-    for event in recording.io:
-        kind = str(event.get("kind"))
-        io_by_kind[kind] = io_by_kind.get(kind, 0) + int(event.get("n", 1))
+    if first_call:
+        following.append(first_call)
+        commands.append(f"ormaos tree {first_call}")
+    io_by_kind = recording.io_counts
     if io_by_kind:
         following.append(recording.name)
         commands.append(f"ormaos io {recording.name}")
@@ -184,7 +180,7 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
         },
         "counts": {
             "processes": len(recording.processes),
-            "calls": len(calls),
+            "calls": recording.n_calls,
             "exceptions": len(exceptions),
             "swallowed": sum(1 for exc in exceptions if exc.get("swallowed")),
             "uncaught": len(uncaught),

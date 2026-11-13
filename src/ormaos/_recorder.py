@@ -308,6 +308,20 @@ def _handler_line(code: CodeType, offset: int, fallback: int) -> int:
     return fallback
 
 
+def _unhook(tb: Any) -> None:
+    """An exception arrived in the program while one of our callbacks was
+    running (a KeyboardInterrupt, or what a signal handler of the program
+    raised). Its traceback then has our frames in the middle; they are taken
+    out, so that the program sees and prints the traceback it would have
+    without us: its own line, then the handler's frames if there are any."""
+    entry = tb.tb_next
+    while entry is not None and entry.tb_frame.f_code.co_filename.startswith(
+        (_PACKAGE_DIR, _STDLIB_DIR, "<frozen")
+    ):
+        entry = entry.tb_next
+    tb.tb_next = entry
+
+
 def _plain_attribute(obj: object, name: str) -> object:
     """An attribute kept in the object's own dict: no property, no
     `__getattr__` of the program is run to read it."""
@@ -1322,6 +1336,13 @@ class Recorder:
 
     def _raise(self, code: CodeType, offset: int, exc: BaseException) -> None:
         try:
+            tb = _get_traceback(exc)
+            if tb is not None:
+                below = tb.tb_next
+                if below is not None and below.tb_frame.f_code.co_filename.startswith(
+                    _PACKAGE_DIR
+                ):
+                    _unhook(tb)
             key = id(exc)
             flight = self._active.get(key)
             if flight is not None:

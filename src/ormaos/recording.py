@@ -23,6 +23,8 @@ process.
 import json
 import os
 import re
+from array import array
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +57,17 @@ class Process:
     # "process": the index of the process that sent the signal, or None}.
     lost: bool = False
     ending: Record | None = None
+    # Counts that do not need the records themselves. They are filled in both
+    # ways of reading; when a recording is read for an overview only
+    # (`load(..., overview=True)`), `calls` and `io` stay empty and these are
+    # all there is: the file is read line by line and no call is kept.
+    n_calls: int = 0
+    call_threads: set[int] = field(default_factory=set)
+    call_tasks: set[int] = field(default_factory=set)
+    has_path: bool = False
+    io_counts: dict[str, int] = field(default_factory=dict)
+    first_call: str | None = None  # the address of its first call
+    call_ids: Any = None  # overview only: the ids of its calls, sorted
 
     @property
     def ending_text(self) -> str:
@@ -122,6 +135,23 @@ class Recording:
         return [call for proc in self.processes for call in proc.calls]
 
     @property
+    def n_calls(self) -> int:
+        return sum(proc.n_calls for proc in self.processes)
+
+    @property
+    def first_call(self) -> str | None:
+        return next((p.first_call for p in self.processes if p.first_call), None)
+
+    @property
+    def io_counts(self) -> dict[str, int]:
+        """I/O events by kind, counting the repeats of an event."""
+        out: dict[str, int] = {}
+        for proc in self.processes:
+            for kind, count in proc.io_counts.items():
+                out[kind] = out.get(kind, 0) + count
+        return out
+
+    @property
     def exceptions(self) -> list[Record]:
         return [exc for proc in self.processes for exc in proc.exceptions]
 
@@ -181,11 +211,15 @@ def flat_header(raw: Record) -> Record:
     return flat
 
 
-def _from_checkpoints(proc: Process, checkpoints: list[Record]) -> None:
+def _from_checkpoints(
+    proc: Process, checkpoints: list[Record], counted: set[int] | None = None
+) -> None:
     """Finish a file that has no end record, the way the recorder would have:
     a call that had not returned is `open`, an exception that was in a handler
     is `handled`, one still in flight has no handler seen."""
-    done_calls = {call.get("id") for call in proc.calls}
+    done_calls: set[Any] = {call.get("id") for call in proc.calls}
+    if counted:
+        done_calls |= counted  # calls that an overview counted without keeping
     done_exceptions = {exc.get("id") for exc in proc.exceptions}
     open_exceptions: dict[Any, Record] = {}
     for point in checkpoints:
@@ -233,48 +267,92 @@ def _note(what: str, reason: str) -> Record:
     return {"k": "not_collected", "what": what, "reason": reason}
 
 
-def _load_process(path: str) -> Process:
-    records, bad = _read_lines(path)
-    header: Record = {}
-    raw: Record = {}
-    if records and records[0].get("kind") == "process":
-        raw = records.pop(0)
-        header = flat_header(raw)
-    proc = Process(index=0, path=path, header=header, raw=raw)
+# A call record as the recorder writes it, read without building it: the
+# keys come in this order. Anything else on the line is not needed for an
+# overview.
+_CALL_LINE = re.compile(r'\{"k":"call","id":(\d+),"parent":(?:null|\d+),')
+_CALL_THREAD = re.compile(r',"thread":(\d+),"t":')
+_CALL_TASK = re.compile(r',"task":(\d+)[,}]')
+
+
+def _load_process(path: str, overview: bool = False) -> Process:
+    proc = Process(index=0, path=path, header={})
     checkpoints: list[Record] = []
+    ids = array("q")
+    bad = 0
+    first = True
     # Does the file end with everything written? True after the header, then
     # as the last checkpoint says; any record after it is something more.
-    clean = bool(header)
+    clean = False
     name = os.path.basename(path)
-    if not header:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if overview:
+                found = _CALL_LINE.match(line)
+                if found is not None and line.endswith("}\n"):
+                    # One call: counted, not kept.
+                    ids.append(int(found.group(1)))
+                    thread = _CALL_THREAD.search(line)
+                    if thread is not None:
+                        proc.call_threads.add(int(thread.group(1)))
+                    task = _CALL_TASK.search(line)
+                    if task is not None:
+                        proc.call_tasks.add(int(task.group(1)))
+                    if not proc.has_path and ',"path":[' in line:
+                        proc.has_path = True
+                    clean = False
+                    first = False
+                    continue
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, RecursionError):
+                bad += 1
+                continue
+            if not isinstance(rec, dict):
+                bad += 1
+                continue
+            if first:
+                first = False
+                if rec.get("kind") == "process":
+                    proc.raw = rec
+                    proc.header = flat_header(rec)
+                    clean = True
+                    continue
+            kind = rec.get("k")
+            clean = kind == "checkpoint" and rec.get("idle") is True
+            if kind in ("call", "exc", "io") and not _well_formed(rec):
+                bad += 1  # valid JSON, but not a record this version writes
+                continue
+            if kind == "call":
+                proc.calls.append(rec)
+            elif kind == "exc":
+                proc.exceptions.append(rec)
+            elif kind == "io":
+                io_kind = str(rec.get("kind"))
+                proc.io_counts[io_kind] = proc.io_counts.get(io_kind, 0) + int(
+                    rec.get("n", 1)
+                )
+                if not overview or io_kind == "subprocess":
+                    proc.io.append(rec)
+            elif kind == "not_collected":
+                proc.not_collected.append(rec)
+            elif kind == "end":
+                proc.end = rec
+            elif kind == "checkpoint":
+                checkpoints.append(rec)
+            elif kind == "child_ended":
+                proc.children_ended.append(rec)
+            elif kind == "child_exit":
+                proc.children_exited.append(rec)
+    if not proc.header:
         proc.not_collected.append(_note(f"header of {name}", "the file has no header"))
-    for rec in records:
-        kind = rec.get("k")
-        clean = kind == "checkpoint" and rec.get("idle") is True
-        if kind in ("call", "exc", "io") and not _well_formed(rec):
-            bad += 1  # valid JSON, but not a record this version writes
-            continue
-        if kind == "call":
-            proc.calls.append(rec)
-        elif kind == "exc":
-            proc.exceptions.append(rec)
-        elif kind == "io":
-            proc.io.append(rec)
-        elif kind == "not_collected":
-            proc.not_collected.append(rec)
-        elif kind == "end":
-            proc.end = rec
-        elif kind == "checkpoint":
-            checkpoints.append(rec)
-        elif kind == "child_ended":
-            proc.children_ended.append(rec)
-        elif kind == "child_exit":
-            proc.children_exited.append(rec)
     proc.lost = proc.end is None and not (clean and not bad)
     if checkpoints and isinstance(checkpoints[-1].get("t"), int):
         proc.written_until = checkpoints[-1]["t"]
     if proc.end is None:
-        _from_checkpoints(proc, checkpoints)
+        _from_checkpoints(proc, checkpoints, set(ids) if overview else None)
     if bad:
         proc.not_collected.append(
             _note(
@@ -286,6 +364,19 @@ def _load_process(path: str) -> Process:
     proc.calls.sort(key=lambda rec: rec.get("id", 0))
     proc.exceptions.sort(key=lambda rec: rec.get("id", 0))
     proc.io.sort(key=lambda rec: rec.get("id", 0))
+    for call in proc.calls:  # every call, or in an overview the few read in full
+        if type(call.get("thread")) is int:
+            proc.call_threads.add(call["thread"])
+        if type(call.get("task")) is int:
+            proc.call_tasks.add(call["task"])
+        proc.has_path = proc.has_path or "path" in call
+    if overview:
+        ids.extend(call["id"] for call in proc.calls)
+        proc.call_ids = array("q", sorted(ids))
+        proc.calls = []
+        proc.n_calls = len(proc.call_ids)
+    else:
+        proc.n_calls = len(proc.calls)
     return proc
 
 
@@ -417,7 +508,41 @@ def _ending_notes(processes: list[Process]) -> None:
             )
 
 
-def load(path: str) -> Recording:
+def _overview_addresses(
+    proc: Process, prefix: str, calls: int, exceptions: int
+) -> None:
+    """The addresses an overview shows, without the call records: a call's
+    address is its place among the calls of the recording, in the order of
+    their ids."""
+    ids = proc.call_ids
+
+    def of(call_id: Any) -> str | None:
+        if type(call_id) is not int:
+            return None
+        at = bisect_left(ids, call_id)
+        if at < len(ids) and ids[at] == call_id:
+            return f"{prefix}:c{calls + at + 1}"
+        return None
+
+    if len(ids):
+        proc.first_call = f"{prefix}:c{calls + 1}"
+    exc_addr: dict[Any, str] = {}
+    for number, exc in enumerate(proc.exceptions, start=exceptions + 1):
+        exc["addr"] = exc_addr[exc.get("id")] = f"{prefix}:e{number}"
+        exc["process"] = proc.index
+    for exc in proc.exceptions:
+        exc["call_addr"] = of(exc.get("at", {}).get("call"))
+        exc["handled_addr"] = of(exc.get("handled", {}).get("call"))
+        for key in ("during", "replaced_by"):
+            if key in exc:
+                exc[f"{key}_addr"] = exc_addr.get(exc[key])
+
+
+def load(path: str, overview: bool = False) -> Recording:
+    """Read a recording. With ``overview``, for the answers that need counts
+    and exceptions only (the summary, `show`, `list`, `status`): the files are
+    read line by line and no call or I/O record is kept, so a large recording
+    takes little memory. `calls` and `io` are then empty; use the counts."""
     match = _DIR_NAME.fullmatch(os.path.basename(os.path.normpath(path)))
     number = int(match.group(1)) if match else 0
     recording = Recording(number=number, path=path, header={})
@@ -432,7 +557,7 @@ def load(path: str) -> Recording:
             elif rec.get("k") == "not_collected":
                 recording.not_collected.append(rec)
     processes = [
-        _load_process(os.path.join(path, name))
+        _load_process(os.path.join(path, name), overview)
         for name in sorted(os.listdir(path))
         if name.startswith("p") and name.endswith(".jsonl")
     ]
@@ -459,11 +584,19 @@ def load(path: str) -> Recording:
     io_n = 0
     for index, proc in enumerate(processes, start=1):
         proc.index = index
+        if overview:
+            _overview_addresses(proc, prefix, call_n, exc_n)
+            call_n += proc.n_calls
+            exc_n += len(proc.exceptions)
+            recording.not_collected.extend(proc.not_collected)
+            continue
         call_addr: dict[Any, str] = {}
         for call in proc.calls:
             call_n += 1
             call["addr"] = call_addr[call.get("id")] = f"{prefix}:c{call_n}"
             call["process"] = index
+        if proc.calls:
+            proc.first_call = proc.calls[0]["addr"]
         exc_addr: dict[Any, str] = {}
         for exc in proc.exceptions:
             exc_n += 1
@@ -494,7 +627,7 @@ def load(path: str) -> Recording:
             for s in proc.header["path_scope"]
         }
     )
-    if scopes and not any("path" in call for call in recording.calls):
+    if scopes and not any(proc.has_path for proc in processes):
         recording.not_collected.append(
             _note("path", f"no call matched the scope {', '.join(scopes)}")
         )

@@ -349,19 +349,23 @@ def _answer(build: Callable[[], dict[str, Any]], as_json: bool) -> int:
 
 def _read(args: argparse.Namespace) -> int:
     from ormaos import verbs
-    from ormaos.show import document
+    from ormaos.recording import load
+    from ormaos.show import document, find
 
     cwd = os.getcwd()
 
     def build() -> dict[str, Any]:
-        target = verbs.resolve(args.address)
         if args.verb == "show":
-            if target.kind != "recording":
+            name, inside, _ = args.address.partition(":")
+            if inside:
+                target = verbs.resolve(args.address)
                 raise verbs.Problem(
                     f"`show` takes a recording; {target.address} is inside one",
                     [f"ormaos show {target.recording.name}"],
                 )
-            return document(target.recording, cwd)
+            # An overview: read line by line, no call is kept in memory.
+            return document(load(find(name), overview=True), cwd)
+        target = verbs.resolve(args.address)
         if args.verb == "tree":
             return verbs.tree(target, cwd, args.limit, args.depth, args.offset or 0)
         if args.verb == "exceptions":

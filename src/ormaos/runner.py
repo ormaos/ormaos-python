@@ -114,7 +114,7 @@ def _let_children_end(directory: str, patience: float = 1.0) -> None:
     try:
         while time.monotonic() < deadline:
             waiting = False
-            for proc in load(directory).processes:
+            for proc in load(directory, overview=True).processes:
                 pid = proc.header.get("pid")
                 if proc.end is None and proc.ending is None and isinstance(pid, int):
                     try:
@@ -202,7 +202,7 @@ def run(
             except Exception:
                 pass
             append(run_file, end)
-            recording = load(directory)
+            recording = load(directory, overview=True)
             for line in summarize(recording, cwd):
                 print(line, file=sys.stderr)
             sys.stderr.flush()

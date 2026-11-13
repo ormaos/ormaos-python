@@ -553,3 +553,73 @@ print(seen)
     out, _ = same(work, "app.py")
     assert out == "{'tool': 10, 'trace': 10}\n"
     assert sum(1 for call in work.last().calls if call["fn"] == "f") == 10
+
+
+def test_an_interrupt_inside_the_recorder_leaves_no_recorder_frame_in_the_traceback(
+    work: Workdir,
+) -> None:
+    source = """\
+import signal, sys, traceback
+
+signal.signal(signal.SIGALRM, signal.default_int_handler)
+
+class Stop(Exception):
+    pass
+
+def raise_stop(signum, frame):
+    raise Stop()
+
+def step(i):
+    return i
+
+def work():
+    i = 0
+    while True:
+        i = step(i) + 1
+
+def frames(error):
+    found = traceback.extract_tb(error.__traceback__)
+    return [(f.filename.rsplit("/", 1)[-1], f.name) for f in found]
+
+signal.setitimer(signal.ITIMER_REAL, 0.2)
+try:
+    work()
+except KeyboardInterrupt as error:
+    seen = frames(error)
+    print("interrupt", [name for file, name in seen if file != "app.py"])
+    print(seen[0], seen[1][1], len(seen) <= 3)
+
+signal.signal(signal.SIGALRM, raise_stop)
+signal.setitimer(signal.ITIMER_REAL, 0.2)
+try:
+    work()
+except Stop as error:
+    seen = frames(error)
+    print("handler", [name for file, name in seen if file != "app.py"])
+    print(seen[0], seen[-1])
+
+signal.setitimer(signal.ITIMER_REAL, 0.2)
+signal.signal(signal.SIGALRM, signal.default_int_handler)
+work()
+"""
+    work.write("app.py", source)
+    for _ in range(3):  # where the signal lands is a matter of timing
+        plain = work.plain(sys.executable, "app.py")
+        result = work.python("app.py")
+        # Every frame of both tracebacks is a frame of the program.
+        assert result.stdout.splitlines()[0] == "interrupt []"
+        assert result.stdout.splitlines()[1] == "('app.py', '<module>') work True"
+        assert result.stdout.splitlines()[2] == "handler []"
+        assert result.stdout.splitlines()[3] == (
+            "('app.py', '<module>') ('app.py', 'raise_stop')"
+        )
+        assert plain.stdout.splitlines()[::2] == result.stdout.splitlines()[::2]
+        # The uncaught one: what Python prints has no line of the recorder.
+        # Python ends itself with SIGINT; `ormaos run` reports it as a shell does.
+        assert (plain.returncode, result.returncode) == (-2, 130)
+        printed = result.program_stderr
+        assert printed.startswith("Traceback (most recent call last):")
+        assert printed.rstrip().endswith("KeyboardInterrupt")
+        assert "ormaos" not in printed and "_recorder" not in printed
+        files = [line for line in printed.splitlines() if line.startswith("  File ")]
+        assert files and all('app.py"' in line for line in files)
