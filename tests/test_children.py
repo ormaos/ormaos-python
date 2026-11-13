@@ -107,91 +107,214 @@ def test_multiprocessing_children_are_recorded_and_linked(
     swallowed = [e for p in workers for e in p.exceptions if e.get("swallowed")]
     assert len(swallowed) == 5
 
-    # The pool ended the workers that were still alive with a signal. That is
-    # the program's own doing: the recording is not incomplete because of it.
-    assert recording.complete and recording.incomplete_reasons == []
-    assert "(incomplete)" not in result.stderr
-    ended = [process for process in processes if process.end is None]
-    for process in ended:
-        assert process.ended_by == {"process": 1, "by": "pool", "signal": 15}
+    # The pool ended the workers that were still alive with a signal: said
+    # for each. (Whether one of them was still starting is a matter of timing
+    # here; the tests below fix it.)
+    for process in processes:
+        if process.end is None:
+            assert process.ending == {"signal": 15, "by": "pool", "process": 1}
+
+
+ENDS = """\
+import multiprocessing as mp, os, signal, sys, time
+
+def quick(n):
+    return n + 1
+
+def slow(n):
+    open(f"busy-{os.getpid()}", "w").close()
+    time.sleep(60)
+
+def slow_start():
+    open(f"busy-{os.getpid()}", "w").close()
+
+def wait_busy(count):
+    while len([name for name in os.listdir(".") if name.startswith("busy-")]) < count:
+        time.sleep(0.01)
+
+if __name__ == "__main__":
+    case, method = sys.argv[1], sys.argv[2]
+    ctx = mp.get_context(method)
+    if case == "idle":
+        with ctx.Pool(2, initializer=slow_start) as pool:
+            wait_busy(2)                       # both workers are up
+            print(pool.map(quick, [1, 2, 3]))
+    elif case == "midtask":
+        with ctx.Pool(2) as pool:
+            pool.map_async(slow, [1, 2])
+            wait_busy(2)
+    else:
+        child = ctx.Process(target=slow, args=(1,))
+        child.start()
+        wait_busy(1)
+        if case == "terminate":
+            child.terminate()
+        elif case == "kill":
+            child.kill()
+        else:
+            os.kill(child.pid, signal.SIGKILL)
+        child.join()
+        print("exit", child.exitcode)
+"""
+METHODS = ["fork", "spawn", "forkserver"]
+
+
+def ended(work: Workdir) -> tuple[dict[str, object], list[dict[str, object]], str]:
+    """The overview, its processes that have no end record, and the text."""
     doc = json.loads(work.cli("show", "--json").stdout)
+    without_end = [p for p in doc["context"]["processes"] if not p["complete"]]
+    return doc, without_end, work.cli("show").stdout
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_a_pool_that_ends_idle_workers_is_complete(work: Workdir, method: str) -> None:
+    work.write("app.py", ENDS)
+    result = work.python("app.py", "idle", method)
+
+    assert result.stdout == "[2, 3, 4]\n"
+    assert result.summary[0].startswith("ormaos: r1 exit 0 ")
+    doc, without_end, text = ended(work)
     assert doc["complete"] is True and doc["incomplete"] == []
-    shown = {p["process"]: p for p in doc["context"]["processes"]}
-    text = work.cli("show").stdout
-    assert "(incomplete)" not in text and "no end record" not in text.split("\n")[1]
-    for process in ended:
-        assert shown[process.index]["complete"] is False  # it has no end record
-        assert shown[process.index]["ended_by"]["by"] == "pool"
-        assert f"process {process.index}: " in text
-        note = f"the end record of process {process.header['pid']}"
-        (reason,) = [n["reason"] for n in doc["not_collected"] if n["what"] == note]
-        assert reason.startswith("its pool ended it with signal 15, so it wrote no")
-        assert reason.endswith("no call of your code was running in it")
-    assert text.count(", ended by its pool (signal 15)") == len(ended)
+    # A worker either got the pool's signal while it waited for a task, or
+    # had already left by itself (timing decides). Both are complete.
+    for process in without_end:
+        # Which signal, and who: said for every process a signal ended.
+        assert process["ended"] == {
+            "signal": 15,
+            "by": "pool",
+            "process": 1,
+            "lost": False,
+        }
+        assert (
+            f"process {process['process']}: " in text
+            and "was ended by its pool with signal 15, nothing left to write" in text
+        )
+    notes = [n for n in doc["not_collected"] if n["what"].startswith("the end record")]
+    assert len(notes) == len(without_end)
+    assert all(
+        note["reason"].startswith(
+            "it was ended by its pool with signal 15; it had no event left to write."
+        )
+        for note in notes
+    )
+    # Every task is there.
+    tree = json.loads(work.cli("tree", "r1", "--depth", "9", "--json").stdout)
+    assert sum(1 for node in tree["nodes"] if node["fn"] == "quick") == 3
     listed = json.loads(work.cli("list", "--json").stdout)["recordings"][0]
     assert listed["complete"] is True
 
 
-ENDED = """\
-import multiprocessing as mp, os, signal, sys, time
+@pytest.mark.parametrize("method", METHODS)
+def test_a_pool_ended_in_the_middle_of_a_task_is_incomplete(
+    work: Workdir, method: str
+) -> None:
+    work.write("app.py", ENDS)
+    result = work.python("app.py", "midtask", method)
 
-def work():
-    with open("ready", "w") as handle:
-        handle.write(str(os.getpid()))
-    time.sleep(60)
+    assert result.returncode == 0
+    assert result.summary[0].startswith("ormaos: r1 (incomplete) exit 0 ")
+    doc, without_end, text = ended(work)
+    assert doc["complete"] is False
+    busy = [p for p in without_end if p["ended"]["lost"]]
+    assert len(busy) == 2
+    for process in busy:
+        assert process["ended"] == {
+            "signal": 15,
+            "by": "pool",
+            "process": 1,
+            "lost": True,
+        }
+        reason = (
+            f"process {process['process']} was ended by its pool with signal 15, "
+            "with events not written"
+        )
+        assert reason in doc["incomplete"] and reason in text
+    assert len(doc["incomplete"]) == 2
+    # The task each worker was in is there, marked open.
+    recording = work.last()
+    open_calls = [c["fn"] for c in recording.calls if c["out"] == "open"]
+    assert open_calls.count("slow") == 2
+    notes = [n for n in doc["not_collected"] if n["what"].startswith("the last events")]
+    assert len(notes) == 2 and all(
+        n["reason"].startswith(
+            "it was ended by its pool with signal 15 before it had written everything"
+        )
+        for n in notes
+    )
 
-if __name__ == "__main__":
-    child = mp.get_context("fork").Process(target=work)
-    child.start()
-    while not os.path.exists("ready") or not open("ready").read():
-        time.sleep(0.01)
-    if sys.argv[1] == "terminate":
-        child.terminate()          # the program ends its own child
-    else:
-        os.kill(int(open("ready").read()), signal.SIGKILL)   # as from outside
-    child.join()
-    print("child exit code", child.exitcode)
-"""
+
+@pytest.mark.parametrize(
+    ("case", "signum", "by", "said"),
+    [
+        (
+            "terminate",
+            15,
+            "program",
+            "was ended by the program (process 1) with signal 15",
+        ),
+        ("kill", 9, "program", "was ended by the program (process 1) with signal 9"),
+        ("outside", 9, "outside", "was ended by signal 9 from outside the program"),
+    ],
+)
+@pytest.mark.parametrize("method", ["fork", "spawn"])
+def test_a_child_ended_in_the_middle_of_its_work_is_incomplete(
+    work: Workdir, method: str, case: str, signum: int, by: str, said: str
+) -> None:
+    work.write("app.py", ENDS)
+    result = work.python("app.py", case, method)
+
+    assert result.stdout == f"exit {-signum}\n"
+    assert result.summary[0].startswith("ormaos: r1 (incomplete) exit 0 ")
+    doc, without_end, text = ended(work)
+    (child,) = [p for p in without_end if p["ended"]["lost"]]
+    assert child["ended"] == {
+        "signal": signum,
+        "by": by,
+        "process": 1 if by == "program" else None,
+        "lost": True,
+    }
+    number = child["process"]
+    assert doc["complete"] is False
+    assert doc["incomplete"] == [f"process {number} {said}, with events not written"]
+    assert f"{said}, events not written" in text
+    recording = work.last()
+    assert [
+        c["fn"] for c in recording.processes[number - 1].calls if c["out"] == "open"
+    ][-1] == "slow"
 
 
-def test_a_child_the_program_ended_itself_is_told_from_one_killed(
+def test_a_child_the_program_ends_when_it_has_nothing_left_is_complete(
     work: Workdir,
 ) -> None:
-    work.write("app.py", ENDED)
+    source = """\
+import multiprocessing as mp, time
 
-    result = work.python("app.py", "terminate")
-    assert result.stdout == "child exit code -15\n"
-    recording = work.last()
-    _parent, child = recording.processes
-    assert child.end is None
-    assert child.ended_by == {"process": 1, "by": "terminate", "signal": 15}
-    assert recording.complete and "(incomplete)" not in result.stderr
-    (note,) = [n for n in recording.not_collected if "end record" in n["what"]]
-    assert note["reason"].startswith(
-        "process 1 ended it with multiprocessing with signal 15"
-    )
-    # It was in the middle of `work`: said, and shown as open.
-    assert note["reason"].endswith(
-        "1 of its calls had not returned and are marked open"
-    )
-    assert [(c["fn"], c["out"]) for c in child.calls] == [("work", "open")]
-    text = work.cli("show").stdout
+if __name__ == "__main__":
+    ctx = mp.get_context("fork")
+    stop = ctx.Event()
+    # The child waits inside the library: no code of the program runs in it.
+    child = ctx.Process(target=stop.wait)
+    child.start()
+    time.sleep(0.3)
+    child.terminate()
+    child.join()
+    print("exit", child.exitcode)
+"""
+    work.write("app.py", source)
+    result = work.python("app.py")
+
+    assert result.stdout == "exit -15\n"
+    assert result.summary[0].startswith("ormaos: r1 exit 0 ")
+    doc, without_end, text = ended(work)
+    (child,) = without_end
+    assert child["ended"] == {
+        "signal": 15,
+        "by": "program",
+        "process": 1,
+        "lost": False,
+    }
+    assert doc["complete"] is True
     assert (
-        "process 2: forked from process 1, 1 call, 0 exceptions, "
-        "ended by process 1 (signal 15)" in text
-    )
-
-    # The same child killed with a signal that did not go through
-    # multiprocessing: nothing in the recording says who did it.
-    (work.path / "ready").unlink()
-    result = work.python("app.py", "kill")
-    assert result.stdout == "child exit code -9\n"
-    recording = work.last()
-    _parent, child = recording.processes
-    assert child.end is None and child.ended_by is None
-    assert not recording.complete
-    assert recording.incomplete_reasons == ["process 2 wrote no end record"]
-    assert result.summary[0].startswith("ormaos: r2 (incomplete) exit 0 ")
-    assert "process 2: forked from process 1, 1 call, 0 exceptions, no end record" in (
-        work.cli("show").stdout
+        "was ended by the program (process 1) with signal 15, nothing left to write"
+        in text
     )

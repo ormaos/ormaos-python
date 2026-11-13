@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from conftest import Workdir, clean_env
 
@@ -34,6 +35,12 @@ def main():
 
 {call}
 """
+
+
+def process_ended(doc: dict[str, Any]) -> dict[str, Any]:
+    (process,) = doc["context"]["processes"]
+    ended: dict[str, Any] = process["ended"]
+    return ended
 
 
 def kill_when_ready(work: Workdir, argv: list[str]) -> subprocess.Popen[str]:
@@ -72,7 +79,17 @@ def test_a_killed_program_is_read_as_far_as_it_was_written(work: Workdir) -> Non
     assert shown.returncode == 0
     doc = json.loads(shown.stdout)
     assert doc["complete"] is False
-    assert doc["incomplete"] == ["process 1 wrote no end record"]
+    # `ormaos run` saw the signal that ended the command.
+    assert doc["incomplete"] == [
+        "process 1 was ended by signal 9 from outside the program, "
+        "with events not written"
+    ]
+    assert process_ended(doc) == {
+        "signal": 9,
+        "by": "outside",
+        "process": None,
+        "lost": True,
+    }
     assert doc["context"]["exit_code"] == 137 and doc["context"]["signal"] == 9
     (process,) = doc["context"]["processes"]
     assert process["complete"] is False and process["written_until_s"] > 0
@@ -87,7 +104,10 @@ def test_a_killed_program_is_read_as_far_as_it_was_written(work: Workdir) -> Non
 
     lines = work.cli("show").stdout.splitlines()
     assert lines[0].startswith("r1 (incomplete) exit 137 (signal 9)")
-    assert lines[1].startswith("incomplete: process 1 wrote no end record")
+    assert lines[1] == (
+        "incomplete: process 1 was ended by signal 9 from outside the program, "
+        "with events not written: shown as far as it was written"
+    )
 
     # The calls that had not returned are there, marked open, above the rest.
     tree = json.loads(work.cli("tree", "r1", "--json").stdout)
@@ -113,10 +133,13 @@ def test_a_killed_record_block_has_no_end_and_is_still_read(work: Workdir) -> No
     assert proc.returncode == -signal.SIGKILL
     doc = json.loads(work.cli("show", "--json").stdout)
     assert doc["complete"] is False
+    # Nothing was there to see the signal: the block was the whole program.
     assert doc["incomplete"] == [
         "the run has no end record",
-        "process 1 wrote no end record",
+        "process 1 has no end record and no signal was seen "
+        "(it may still be running), with events not written",
     ]
+    assert process_ended(doc) == {"signal": None, "by": None, "lost": True}
     assert doc["context"]["mode"] == "record"
     assert doc["counts"]["calls"] >= 40 and doc["counts"]["swallowed"] >= 40
     first = work.cli("show").stdout.splitlines()[0]

@@ -115,7 +115,7 @@ def _let_children_end(directory: str, patience: float = 1.0) -> None:
             waiting = False
             for proc in load(directory).processes:
                 pid = proc.header.get("pid")
-                if proc.end is None and proc.ended_by is None and isinstance(pid, int):
+                if proc.end is None and proc.ending is None and isinstance(pid, int):
                     try:
                         os.kill(pid, 0)
                         waiting = True
@@ -187,6 +187,7 @@ def run(
                 "k": "end",
                 "exit_code": code,
                 "signal": signum,
+                "command_pid": proc.pid,
                 "dur": time.perf_counter_ns() - started,
                 "cpu_user": after.children_user - before.children_user,
                 "cpu_system": after.children_system - before.children_system,

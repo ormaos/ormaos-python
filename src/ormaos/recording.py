@@ -41,11 +41,37 @@ class Process:
     header: Record
     raw: Record = field(default_factory=dict)
     parent: int | None = None  # the index of the process that started it
-    # Signals this process sent to multiprocessing children it started.
+    # Signals this process sent to children it started, and what it learned
+    # about how its children ended (`multiprocessing`, `subprocess`).
     children_ended: list[Record] = field(default_factory=list)
-    # Set when a recorded process ended this one itself (multiprocessing
-    # `terminate`, the end of a `Pool`): {"process", "by", "signal"}.
-    ended_by: Record | None = None
+    children_exited: list[Record] = field(default_factory=list)
+    # For a process with no end record. `lost`: its file does not end with an
+    # idle checkpoint, so events it had not written yet may be missing (the
+    # recorder says at every write whether anything is still unwritten).
+    # `ending`: how it ended, as far as another record says:
+    # {"signal": 15 or None, "by": "pool", "program", "outside" or None,
+    # "process": the index of the process that sent the signal, or None}.
+    lost: bool = False
+    ending: Record | None = None
+
+    @property
+    def ending_text(self) -> str:
+        """`was ended by its pool with signal 15`, for a process with no end
+        record."""
+        ending = self.ending or {}
+        signum = ending.get("signal")
+        by = ending.get("by")
+        if by == "pool":
+            return f"was ended by its pool with signal {signum}"
+        if by == "program":
+            return (
+                f"was ended by the program (process {ending.get('process')}) "
+                f"with signal {signum}"
+            )
+        if by == "outside":
+            return f"was ended by signal {signum} from outside the program"
+        return "has no end record and no signal was seen (it may still be running)"
+
     written_until: int | None = None  # `t` of the last checkpoint
     calls: list[Record] = field(default_factory=list)
     exceptions: list[Record] = field(default_factory=list)
@@ -69,27 +95,21 @@ class Recording:
 
     @property
     def complete(self) -> bool:
-        """The run wrote its end record, and so did every process that the
-        recorded program did not end itself (a pool ends its workers with a
-        signal: that is the program's own doing, not a kill from outside)."""
-        return self.end is not None and all(
-            proc.end is not None or proc.ended_by is not None for proc in self.processes
-        )
+        """The run wrote its end record, and no process ended with events it
+        had not written yet. Who ended a process does not matter: a process
+        ended by a signal after it had written everything lost nothing."""
+        return self.end is not None and not any(proc.lost for proc in self.processes)
 
     @property
     def incomplete_reasons(self) -> list[str]:
         reasons = []
         if self.end is None:
             reasons.append("the run has no end record")
-        open_ = [
-            proc.index
-            for proc in self.processes
-            if proc.end is None and proc.ended_by is None
-        ]
-        if open_:
-            numbers = ", ".join(str(index) for index in open_)
-            word = "process" if len(open_) == 1 else "processes"
-            reasons.append(f"{word} {numbers} wrote no end record")
+        for proc in self.processes:
+            if proc.lost:
+                reasons.append(
+                    f"process {proc.index} {proc.ending_text}, with events not written"
+                )
         return reasons
 
     @property
@@ -193,11 +213,15 @@ def _load_process(path: str) -> Process:
         header = flat_header(raw)
     proc = Process(index=0, path=path, header=header, raw=raw)
     checkpoints: list[Record] = []
+    # Does the file end with everything written? True after the header, then
+    # as the last checkpoint says; any record after it is something more.
+    clean = bool(header)
     name = os.path.basename(path)
     if not header:
         proc.not_collected.append(_note(f"header of {name}", "the file has no header"))
     for rec in records:
         kind = rec.get("k")
+        clean = kind == "checkpoint" and rec.get("idle") is True
         if kind == "call":
             proc.calls.append(rec)
         elif kind == "exc":
@@ -212,6 +236,9 @@ def _load_process(path: str) -> Process:
             checkpoints.append(rec)
         elif kind == "child_ended":
             proc.children_ended.append(rec)
+        elif kind == "child_exit":
+            proc.children_exited.append(rec)
+    proc.lost = proc.end is None and not (clean and not bad)
     if checkpoints and isinstance(checkpoints[-1].get("t"), int):
         proc.written_until = checkpoints[-1]["t"]
     if proc.end is None:
@@ -253,61 +280,70 @@ def _link(processes: list[Process]) -> None:
                 continue
             if (other.header.get("started") or 0.0) <= started:
                 proc.parent = other.index
-    # Who ended whom: a signal sent through multiprocessing, after the child
-    # started, to a child that then wrote no end record.
-    for sender in processes:
-        base = sender.header.get("started") or 0.0
-        for sent in sender.children_ended:
-            at = base + (sent.get("t") or 0) / 1e9
-            for proc in processes:
+    # How a process with no end record ended: the signal its parent saw when
+    # it waited for it, and whether the program sent that signal itself.
+    for proc in processes:
+        if proc.end is not None:
+            continue
+        pid = proc.header.get("pid")
+        started = proc.header.get("started") or 0.0
+        sent: Record | None = None
+        sender = 0
+        seen: Record | None = None
+        for other in processes:
+            base = other.header.get("started") or 0.0
+            for rec in other.children_ended:
                 if (
-                    proc.end is None
-                    and proc.ended_by is None
-                    and proc.header.get("pid") == sent.get("pid")
-                    and (proc.header.get("started") or 0.0) <= at
+                    rec.get("pid") == pid
+                    and started <= base + (rec.get("t") or 0) / 1e9
                 ):
-                    proc.ended_by = {
-                        "process": sender.index,
-                        "by": sent.get("by"),
-                        "signal": sent.get("signal"),
-                    }
+                    sent, sender = rec, other.index
+            for rec in other.children_exited:
+                if (
+                    rec.get("pid") == pid
+                    and started <= base + (rec.get("t") or 0) / 1e9
+                ):
+                    seen = rec
+        if seen is not None and (
+            sent is None or sent.get("signal") != seen.get("signal")
+        ):
+            proc.ending = {
+                "signal": seen.get("signal"),
+                "by": "outside",
+                "process": None,
+            }
+        elif sent is not None:
+            proc.ending = {
+                "signal": sent.get("signal"),
+                "by": sent.get("by"),
+                "process": sender,
+            }
+
+
+def _ending_notes(processes: list[Process]) -> None:
     for proc in processes:
         if proc.end is not None:
             continue
         pid = proc.header.get("pid", "?")
-        if proc.ended_by is None:
+        if proc.lost:
             proc.not_collected.append(
                 _note(
                     f"the last events of process {pid}",
-                    "the process ended without running its exit handlers "
-                    "(killed, os._exit, or still running); what it had written "
-                    "is here, and the calls that had not returned are marked open",
+                    f"it {proc.ending_text} before it had written everything: "
+                    "what it wrote is here, the calls that had not returned are "
+                    "marked open, and up to 256 records or what happened in its "
+                    "last 0.2 seconds can be missing",
                 )
             )
-            continue
-        who = (
-            "its pool ended it"
-            if proc.ended_by["by"] == "pool"
-            else f"process {proc.ended_by['process']} ended it with multiprocessing"
-        )
-        # The top of a spawned child is the `<module>` of its start command.
-        running = sum(
-            1
-            for call in proc.calls
-            if call.get("out") == "open" and call.get("fn") != "<module>"
-        )
-        tail = (
-            f"; {running} of its calls had not returned and are marked open"
-            if running
-            else "; no call of your code was running in it"
-        )
-        proc.not_collected.append(
-            _note(
-                f"the end record of process {pid}",
-                f"{who} with signal {proc.ended_by['signal']}, so it wrote no end "
-                f"record: its duration, CPU and memory are missing{tail}",
+        else:
+            proc.not_collected.append(
+                _note(
+                    f"the end record of process {pid}",
+                    f"it {proc.ending_text}; it had no event left to write. What "
+                    "a process writes when it ends is missing: its duration, CPU "
+                    "and memory, and the counts of what it saw and did not record",
+                )
             )
-        )
 
 
 def load(path: str) -> Recording:
@@ -333,6 +369,18 @@ def load(path: str) -> Recording:
         key=lambda p: (p.header.get("started", 0.0), p.header.get("pid", 0), p.path)
     )
     _link(processes)
+    # The command itself: `ormaos run` saw the signal that ended it.
+    signum = (recording.end or {}).get("signal")
+    command_pid = (recording.end or {}).get("command_pid")
+    for proc in processes:
+        if (
+            signum
+            and proc.end is None
+            and proc.ending is None
+            and proc.header.get("pid") == command_pid
+        ):
+            proc.ending = {"signal": signum, "by": "outside", "process": None}
+    _ending_notes(processes)
     prefix = recording.name
     call_n = 0
     exc_n = 0

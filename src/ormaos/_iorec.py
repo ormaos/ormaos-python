@@ -484,6 +484,16 @@ class IoRecorder:
         self._written = set()
         self._opening = {}
 
+    def release(self) -> None:
+        """Write the event this thread was still counting repeats of."""
+        held = self._held.pop(_thread.get_ident(), None)
+        if held is not None:
+            self._rec._emit(held[1])
+
+    def busy(self) -> bool:
+        """Is an event still waiting to be written?"""
+        return bool(self._held or self._waiting)
+
     def finish(self) -> None:
         """Write the events that were still open."""
         self._on = False
@@ -630,7 +640,13 @@ class IoRecorder:
             rec["task"] = task
         if repeat:
             rec["n"] = 1
-            self._held[ident] = (sig, rec)
+            if call is None:
+                # No recorded call is running here (frames a forked child got
+                # from its parent): nothing will come to close it, so it is
+                # written now and not held to count repeats.
+                recorder._emit(rec, True)
+            else:
+                self._held[ident] = (sig, rec)
         return rec
 
     def _orphan(self, kind: str) -> None:
@@ -960,6 +976,8 @@ class IoRecorder:
                 self._rec._emit(other)
             self._waiting = {}
         self._waiting[key] = rec
+        if rec.get("call") is None:
+            self._rec._flush_now()  # say now that something is not written yet
 
     def _http_send(self, args: Any, frame: FrameType) -> None:
         """`http.client` sends bytes. A request starts with `GET /path HTTP/1.1`."""

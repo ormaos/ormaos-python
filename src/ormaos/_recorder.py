@@ -59,6 +59,19 @@ _MP_BOOTSTRAP = ("_bootstrap", os.sep + os.path.join("multiprocessing", "process
 # started (`Process.terminate`, `Process.kill`, the end of a `Pool`). The
 # parent writes down that it ended that child itself.
 _MP_SIGNAL = ("_send_signal", os.sep + os.path.join("multiprocessing", "popen_fork.py"))
+# Library functions that are watched, by name and file: what a watched
+# function is for. `sent`: the program sends a signal to a child it started.
+# `exit`: the program learns how a child ended. `bootstrap`: see above.
+_SUBPROCESS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(os.__file__)), "subprocess.py"
+)
+_WATCHED: dict[str, tuple[str, str]] = {
+    _MP_BOOTSTRAP[0]: (_MP_BOOTSTRAP[1], "bootstrap"),
+    _MP_SIGNAL[0]: (_MP_SIGNAL[1], "sent"),
+    "poll": (_MP_SIGNAL[1], "exit"),
+    "send_signal": (_SUBPROCESS_FILE, "sent"),
+    "_handle_exitstatus": (_SUBPROCESS_FILE, "exit"),
+}
 _MP_POOL = os.sep + os.path.join("multiprocessing", "pool.py")
 _KERNEL_CELL = os.sep + "ipykernel_"
 # The recorder that is recording in this process, if any.
@@ -298,6 +311,8 @@ class Recorder:
         self._ck_call = 0  # the highest call id already in a checkpoint
         self._base: int | None = None  # see _MP_BOOTSTRAP
         self._cells_noted = False
+        self._exits_seen: set[tuple[int, int]] = set()
+        self._finishing = False
         # asyncio tasks: id(task) -> the number we gave it. A weak reference
         # forgets the task when it is gone, so a reused id() gets a new number.
         self._aio: Any = None
@@ -512,6 +527,7 @@ class Recorder:
             self._tasks = {}
             self._task_refs = {}
             self._ck_call = 0
+            self._exits_seen = set()
             self._t0 = time.perf_counter_ns()
             self._last_write = self._t0
             if self._fd >= 0:
@@ -533,16 +549,25 @@ class Recorder:
             self._stop()
         except Exception:
             pass
+        # What the end adds (the records still open, the notes, the end
+        # record) is written in one piece: a process that is ended by a signal
+        # while it finishes leaves either all of it or none of it.
+        self._finishing = True
         try:
             if not self._dead:
                 self._finish_records()
-            self._flush()
         except Exception as err:
             self._fail(err)
         try:
-            # Written directly, so the end record exists even after a failure.
-            line = json.dumps(self._end_record(), separators=(",", ":")) + "\n"
-            Recorder._write_out(self, line.encode("utf-8"))
+            lines = [json.dumps(rec, separators=(",", ":")) for rec in self._buf]
+            self._buf = []
+        except Exception as err:
+            lines = []
+            self._fail(err)
+        try:
+            # The end record is written even after a failure.
+            lines.append(json.dumps(self._end_record(), separators=(",", ":")))
+            Recorder._write_out(self, ("\n".join(lines) + "\n").encode("utf-8"))
         except Exception:
             pass
         try:
@@ -629,6 +654,8 @@ class Recorder:
             self._owner = _thread.get_ident()
             try:
                 self._buf.append(rec)
+                if self._finishing:
+                    return  # `finish` writes everything at once
                 now = time.perf_counter_ns()
                 if (
                     now_too
@@ -656,6 +683,8 @@ class Recorder:
 
     def _flush_now(self) -> None:
         """Write what waits, and a checkpoint, without a new record."""
+        if self._finishing:
+            return
         with self._lock:
             self._owner = _thread.get_ident()
             try:
@@ -700,7 +729,18 @@ class Recorder:
                         if key in copy:
                             copy[key] = dict(copy[key])
                     exceptions.append(copy)
-        out: dict[str, Any] = {"k": "checkpoint", "t": now - self._t0}
+        # `idle`: with this chunk, everything that happened is written. No
+        # call of the user's code is running or suspended, no exception is in
+        # flight, no I/O event is being counted. The next thing that happens
+        # starts with a call that is written at once, so a file that ends
+        # with an idle checkpoint lost nothing, however the process ended.
+        idle = not self._active and (self._io is None or not self._io.busy())
+        if idle:
+            for _code, rec in entries:
+                if rec is None or rec["id"] != self._base:
+                    idle = False
+                    break
+        out: dict[str, Any] = {"k": "checkpoint", "t": now - self._t0, "idle": idle}
         if calls:
             out["calls"] = calls
         if exceptions:
@@ -708,8 +748,7 @@ class Recorder:
         return out
 
     def _note(self, what: str, reason: str) -> None:
-        self._emit({"k": "not_collected", "what": what, "reason": reason})
-        self._flush()
+        self._emit({"k": "not_collected", "what": what, "reason": reason}, True)
 
     def _fail(self, err: BaseException) -> None:
         """Internal error: stop recording, keep the program running."""
@@ -925,7 +964,10 @@ class Recorder:
         # written right away, because such a process is often ended with a
         # signal.
         parent = rec["parent"]
-        self._emit(rec, parent is None or parent == self._base)
+        root = parent is None or parent == self._base
+        if root and self._io is not None:
+            self._io.release()  # the I/O event this thread was still counting
+        self._emit(rec, root)
 
     # ---------------------------------------------------------------- calls
 
@@ -938,18 +980,16 @@ class Recorder:
                 if io is not None and code.co_name in _IO_NAMES and io.wants(code):
                     io.started(code, sys._getframe(1))
                     return None
-                if code.co_name == _MP_BOOTSTRAP[0] and code.co_filename.endswith(
-                    _MP_BOOTSTRAP[1]
-                ):
-                    # A multiprocessing child starts its work here. What it
-                    # runs from now on has this call above it, or none.
-                    self._base = self._top(self._thread_state().stack)
-                    return None  # keep its return visible: see _py_return
-                if code.co_name == _MP_SIGNAL[0] and code.co_filename.endswith(
-                    _MP_SIGNAL[1]
-                ):
-                    self._child_signalled(sys._getframe(1))
-                    return None  # every signal is to be seen, not only the first
+                watched = _WATCHED.get(code.co_name)
+                if watched is not None and code.co_filename.endswith(watched[0]):
+                    if watched[1] == "bootstrap":
+                        # A multiprocessing child starts its work here. What
+                        # it runs from now on has this call above it, or none.
+                        self._base = self._top(self._thread_state().stack)
+                        self._flush_now()  # what led here is written
+                    elif watched[1] == "sent":
+                        self._child_signalled(sys._getframe(1))
+                    return None  # keep every call and return of it visible
                 return _DISABLE
             state = self._thread_state()
             stack = state.stack
@@ -1001,10 +1041,12 @@ class Recorder:
                 if io is not None and code in io.watched:
                     io.returned(code, sys._getframe(1), retval)
                     return None
-                if code.co_name == _MP_BOOTSTRAP[0] and code.co_filename.endswith(
-                    _MP_BOOTSTRAP[1]
-                ):
-                    self.finish()  # a multiprocessing child is about to exit
+                watched = _WATCHED.get(code.co_name)
+                if watched is not None and code.co_filename.endswith(watched[0]):
+                    if watched[1] == "bootstrap":
+                        self.finish()  # a multiprocessing child is about to exit
+                    elif watched[1] == "exit":
+                        self._child_exited(sys._getframe(1))
                     return None
                 return _DISABLE
             if self._watching:
@@ -1126,15 +1168,38 @@ class Recorder:
         except Exception as err:
             self._fail(err)
 
+    def _child_exited(self, frame: FrameType) -> None:
+        """This process has just learned how a child it started ended
+        (`multiprocessing` or `subprocess` waited for it). Written when a
+        signal ended the child: the child itself could not say so."""
+        child = frame.f_locals.get("self")
+        pid = getattr(child, "pid", None)
+        code = getattr(child, "returncode", None)
+        if type(pid) is not int or type(code) is not int or code >= 0:
+            return
+        if (pid, code) in self._exits_seen:
+            return
+        self._exits_seen.add((pid, code))
+        self._emit(
+            {
+                "k": "child_exit",
+                "pid": pid,
+                "signal": -code,
+                "t": time.perf_counter_ns() - self._t0,
+            },
+            True,
+        )
+
     def _child_signalled(self, frame: FrameType) -> None:
-        """This process is about to send a signal to a multiprocessing child.
-        Written at once: the child will write no end record."""
+        """This process is about to send a signal to a child it started
+        (`multiprocessing` or `subprocess`: terminate, kill, the end of a
+        pool). Written at once: the child may write no end record."""
         local = frame.f_locals
         pid = getattr(local.get("self"), "pid", None)
         signum = local.get("sig")
         if type(pid) is not int or not isinstance(signum, int):
             return
-        by = "terminate"
+        by = "program"
         above = frame.f_back
         for _ in range(8):
             if above is None:

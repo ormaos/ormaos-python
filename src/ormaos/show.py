@@ -76,7 +76,10 @@ def _process(proc: Process) -> dict[str, Any]:
         "executable": header.get("executable"),
         "argv": header.get("argv"),
         "complete": proc.end is not None,
-        "ended_by": proc.ended_by,
+        "ended": None
+        if proc.end is not None
+        else {**(proc.ending or {"signal": None, "by": None}), "lost": proc.lost},
+        "ended_text": None if proc.end is not None else proc.ending_text,
         "written_until_s": _seconds(proc.written_until),
         "duration_s": _seconds(end.get("dur")),
         "cpu_user_s": end.get("cpu_user"),

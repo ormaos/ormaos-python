@@ -285,7 +285,7 @@ def _show(doc: Doc) -> list[str]:
         lines.append(
             "incomplete: "
             + "; ".join(doc["incomplete"])
-            + " (killed, or still running): shown as far as it was written"
+            + ": shown as far as it was written"
         )
     command = context.get("command")
     if command:
@@ -296,18 +296,15 @@ def _show(doc: Doc) -> list[str]:
             parent = proc.get("parent_process")
             how = "forked from" if proc.get("forked") else "started by"
             origin = f"{how} process {parent}" if parent else "the first"
-            ended = proc.get("ended_by")
             if proc.get("complete"):
                 end = ""
-            elif ended and ended.get("by") == "pool":
-                end = f", ended by its pool (signal {ended.get('signal')})"
-            elif ended:
-                end = (
-                    f", ended by process {ended.get('process')} "
-                    f"(signal {ended.get('signal')})"
-                )
             else:
-                end = ", no end record"
+                written = (
+                    "events not written"
+                    if (proc.get("ended") or {}).get("lost")
+                    else "nothing left to write"
+                )
+                end = f", {proc.get('ended_text')}, {written}"
             lines.append(
                 f"process {proc['process']}: {origin}, "
                 f"{_plural(proc['calls'], 'call')}, "

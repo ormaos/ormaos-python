@@ -121,7 +121,11 @@ def test_exit_code_when_killed_by_a_signal(work: Workdir) -> None:
     recording = work.last()
     assert recording.end is not None and recording.end["signal"] == 9
     # The process could not write its last events: it says so.
-    assert any("ended without" in n["reason"] for n in recording.not_collected)
+    (note,) = [n for n in recording.not_collected if "last events" in n["what"]]
+    assert note["reason"].startswith(
+        "it was ended by signal 9 from outside the program before it had written"
+    )
+    assert not recording.complete
 
 
 def test_command_that_is_not_python(work: Workdir) -> None:
