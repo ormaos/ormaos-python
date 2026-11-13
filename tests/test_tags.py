@@ -75,7 +75,12 @@ def test_calls_exceptions_and_io_carry_thread_task_and_process(work: Workdir) ->
     by_address = {call["addr"]: call for call in recording.calls}
     for call in of("plain")[2:]:
         assert call["task"] == by_address[call["parent_addr"]]["task"]
-    in_jobs = [exc for exc in recording.exceptions if exc.get("handled_addr")]
+    # The program's own exceptions; asyncio raises others to end a coroutine.
+    in_jobs = [
+        exc
+        for exc in recording.exceptions
+        if exc["type"] == "ValueError" and "task" in exc
+    ]
     for exc in in_jobs:
         assert exc.get("task") == by_address[exc["handled_addr"]].get("task")
     assert sum(1 for exc in in_jobs if "task" in exc) == 6
