@@ -35,6 +35,21 @@ dev = [
     "requests>=2.31",
     "httpx>=0.27",
 ]
+# The libraries of the compatibility matrix (tests/compat). Not needed to
+# develop or to run the other tests.
+compat = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "flask>=3",
+    "fastapi>=0.115",
+    "django>=5",
+    "click>=8",
+    "pandas>=2.2",
+    "coverage>=7.6",
+    "nbclient>=0.10",
+    "nbformat>=5.10",
+    "ipykernel>=6.29",
+]
 
 [tool.hatch.version]
 path = "src/ormaos/__init__.py"

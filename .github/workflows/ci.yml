@@ -61,6 +61,25 @@ jobs:
           ORMAOS_DEMO_REQUIRED: "1"
           ORMAOS_DEMO_PYTHON: ${{ github.workspace }}/ormaos-examples/order-sync/.venv/bin/python
 
+  # One small example per library, each recorded and checked against
+  # docs/compatibility.md. The libraries are in the `compat` dependency group.
+  compat:
+    name: Compatibility matrix (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install with the libraries of the matrix
+        run: uv sync --locked --group compat
+      - name: Run every row
+        run: uv run --group compat pytest tests/compat -v
+        env:
+          ORMAOS_COMPAT_REQUIRED: "1"
+
   gitleaks:
     name: gitleaks
     runs-on: ubuntu-latest
