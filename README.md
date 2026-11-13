@@ -2,7 +2,7 @@
 
 Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent.
 
-> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions, I/O and, inside a scope you ask for, the lines that ran. `ormaos show`, `tree`, `exceptions`, `path` and `io` read a recording. `ormaos guide` tells a coding agent how to use it.
+> Status: being built for Hack Brasil 2026. `ormaos run` records calls, exceptions, I/O and, inside a scope you ask for, the lines that ran; `with ormaos.record():` does the same for a block of a script or a notebook. `ormaos show`, `tree`, `exceptions`, `path`, `io` and `diff` read a recording, `ormaos list` and `ormaos status` say what is there. `ormaos guide` tells a coding agent how to use it.
 
 ## What works today
 
@@ -27,12 +27,48 @@ ormaos: saved in .ormaos/r1, next: ormaos exceptions r1:e1 | ormaos tree r1:c1
 
 The recording is in `.ormaos/r1/`, as JSON lines (`"format": "provisional-0"`, it will change):
 
-- `context`: the command, the names of the environment variables (never the values), duration, CPU, memory, threads, and one file per Python process.
+- `context`: the command, the names of the environment variables (never the values), duration, CPU, memory, threads, and one file per Python process: the Python subprocesses and the `multiprocessing` children are in the same recording, each linked to the process that started it.
 - `calls`: the call tree of your code, with the shape of the arguments and of the return value.
 - `exceptions`: every exception that passes through your code, where it was raised and where it was handled, marked `swallowed` when it was handled and not raised again.
 - `io`: sqlite3 statements, files opened, read and written, subprocesses started and HTTP requests, each with the line of your code that caused it (see below).
 - `path`: line by line, only inside a scope you ask for with `--path` (see below).
 - `not_collected`: everything that was not recorded, with the reason.
+
+Every call, exception and I/O event says which process, which thread and, inside asyncio, which task it ran in. The numbers are small and belong to one recording (`thread 2`, `task 5`); names are not recorded.
+
+### In a script or a notebook: `with ormaos.record():`
+
+```python
+import ormaos
+
+with (
+    ormaos.record()
+):  # or: ormaos.record(path="job.py:sync_orders", io=False, summary=True)
+    main()
+```
+
+The block is recorded into `.ormaos/` like a run, with the Python processes started inside it, and is read with the same commands. Only what runs inside the block is recorded. If the recording cannot start, the block runs unrecorded and nothing is raised; an exception of the block goes through unchanged. Under `ormaos run`, the block is part of that recording. While the block runs, `ORMAOS_DIR`, `ORMAOS_PATH` and `ORMAOS_IO` are set in the environment (that is how child processes find the recording) and put back after.
+
+### What is there: `ormaos list` and `ormaos status`
+
+```bash
+ormaos list      # the recordings, newest first: when, how it ended, how long, the counts, the command
+ormaos status    # the version, whether this Python can record, what is running now, the last recording
+```
+
+```
+3 recordings in .ormaos, newest first
+r3  2026-11-13 11:03:34  exit 137 (signal 9), incomplete  759.1ms  1 process, 62 calls, 59 exceptions (59 swallowed)  python job.py
+r2  2026-11-13 11:03:33  exit 0  343.2ms  1 process, 240 calls, 6 exceptions (5 swallowed), 123 io  python job.py --source api
+```
+
+### A process that is killed
+
+The recorder writes in chunks while the program runs: every 256 records, every 0.2 seconds (checked when a record arrives), and when a call that has no call of your code above it ends. Each chunk ends with a checkpoint: the calls that have not returned and the exceptions whose end is not known yet. So after `kill -9`, or while the program is still running, `ormaos show` reads what was written: the recording is marked `(incomplete)`, the calls that had not returned are shown as `-> open`, and `not_collected` says that the last events of that process may be missing. `multiprocessing` children end with `os._exit`; their recording is closed when their work returns. Pool workers are ended by the pool with a signal, so a recording with a pool is marked incomplete; every finished task is there.
+
+### The file header
+
+Every file starts with one line: `"format": "provisional-0"`, `"kind"`, and two parts. `core` is what a recorder of any language would write: the process (`pid`, `ppid`, `cwd`) or the command, the `capabilities` that were recorded (`context`, `calls`, `exceptions`, `path`, `io`), what is never recorded, and `anchor`: `{"t": 0, "unix": 1794578386.2, "clock": "monotonic, nanoseconds"}`. Event times (`t`) are nanoseconds on a monotonic clock; the anchor says which moment of the wall clock `t = 0` was. `python` is what only this recorder knows: the version, the executable, how Python was started, whether the process was forked, the path scope.
 
 ## Reading a recording
 
@@ -172,7 +208,9 @@ Shape always, value never: Ormaos records types, lengths and structure (`{"type"
 - Recording costs time on every call, and the files are large for long runs. At most 200,000 calls, 50,000 exceptions and 200,000 lines are kept per process (`ORMAOS_MAX_CALLS`, `ORMAOS_MAX_EXCEPTIONS`, `ORMAOS_MAX_LINES`); the rest is listed in `not_collected`. `bench/` measures the cost (see "Measuring the cost").
 - `path` has the lines of the functions inside the scope, not of the functions they call (those appear as calls).
 - At most 100,000 I/O events are kept per process (`ORMAOS_MAX_IO`). The same event repeated at the same line is one event with a count.
-- A process that is killed, or that ends with `os._exit`, loses its last events. The recording says so.
+- A process that is killed, or that ends with `os._exit`, loses the events that were not written yet: at most 256 records or what arrived in the last 0.2 seconds (see "A process that is killed"). The recording says so.
+- Thread numbers come from the thread identifier: a thread that starts after another one has ended can get the same number. Task numbers are per process.
+- `with ormaos.record():` records the calls made inside the block; the function that contains the block is not a call of the recording. In a notebook, the cells are your code when their name is `<ipython-input-...>` or a file outside `site-packages`; this was tested with code compiled under such a name, not inside Jupyter.
 - Tested on Linux only.
 
 ## Measuring the cost
