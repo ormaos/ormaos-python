@@ -97,13 +97,14 @@ _OPEN_CALL_KEYS = ("k", "id", "parent", "fn", "file", "line", "thread", "t", "ar
 class _Flight:
     """One exception, from the first time we see it until it is handled."""
 
-    __slots__ = ("during", "frame", "key", "rec", "unwound", "written")
+    __slots__ = ("during", "frame", "key", "rec", "seen", "unwound", "written")
 
     def __init__(self, key: int, rec: dict[str, Any]) -> None:
         self.key = key  # id() of the exception object
         self.rec = rec
         self.unwound = 0  # id() of the last frame it left, 0 if none yet
         self.frame = 0  # id() of the frame whose handler caught it
+        self.seen = 0  # id() of the frame it was last raised in
         self.during: _Flight | None = None  # the exception being handled
         self.written = 0  # in the last checkpoint: 1 as in flight, 2 as handled
 
@@ -965,6 +966,8 @@ class Recorder:
                 return _DISABLE
             if self._watching:
                 self._unwatch(id(sys._getframe(1)))
+            if self._active:
+                self._absorbed(id(sys._getframe(1)))
             self._close(code, "returned", retval)
         except Exception as err:
             self._fail(err)
@@ -1001,6 +1004,8 @@ class Recorder:
                 return _DISABLE
             if self._watching:
                 self._unwatch(id(sys._getframe(1)))
+            if self._active:
+                self._absorbed(id(sys._getframe(1)))
             entry = self._pop(code)
             if entry is not None:
                 self._suspended[id(sys._getframe(1))] = entry
@@ -1053,6 +1058,7 @@ class Recorder:
                 below = tb.tb_next if tb is not None else None
                 if below is not None and id(below.tb_frame) == flight.unwound:
                     flight.unwound = 0  # the same exception, one frame up
+                    flight.seen = id(sys._getframe(1))
                     return
                 # A new exception object that got the id() of an old one. The
                 # old one left Python frames and no handler was reported.
@@ -1068,6 +1074,7 @@ class Recorder:
                     # `raise e` inside the handler that caught `e`: it goes on.
                     old.rec.pop("handled", None)
                     old.unwound = 0
+                    old.seen = id(sys._getframe(1))
                     self._active[key] = old
                     return
                 self._finish_handled(old)
@@ -1075,6 +1082,17 @@ class Recorder:
                 self._begin(code, sys._getframe(1), exc, key)
         except Exception as err:
             self._fail(err)
+
+    def _absorbed(self, frame_id: int) -> None:
+        """A frame returns or yields while an exception that was raised in it
+        is still in flight there: the interpreter took it without a handler
+        (the `StopIteration` that carries the result of an `await` or of a
+        `yield from`). It is over; its id() can be given to a new exception."""
+        for flight in list(self._active.values()):
+            if flight.seen == frame_id and not flight.unwound:
+                del self._active[flight.key]
+                flight.rec["end"] = "no_handler_seen"
+                self._emit(flight.rec)
 
     def _begin(
         self, code: CodeType, frame: FrameType, exc: BaseException, key: int
@@ -1110,6 +1128,7 @@ class Recorder:
         if task is not None:
             rec["task"] = task
         flight = _Flight(key, rec)
+        flight.seen = id(frame)
         if current is not None and current is not exc:
             handling = self._handled.get(id(current))
             if handling is not None:
@@ -1192,6 +1211,7 @@ class Recorder:
                     self._unwatch(id(sys._getframe(1)))
                 flight.rec.pop("handled", None)
                 flight.unwound = 0
+                flight.seen = id(sys._getframe(1))
                 self._active[key] = flight
             elif self._user(code):
                 self._begin(code, sys._getframe(1), exc, key)
