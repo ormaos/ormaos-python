@@ -60,6 +60,7 @@ _MP_BOOTSTRAP = ("_bootstrap", os.sep + os.path.join("multiprocessing", "process
 # parent writes down that it ended that child itself.
 _MP_SIGNAL = ("_send_signal", os.sep + os.path.join("multiprocessing", "popen_fork.py"))
 _MP_POOL = os.sep + os.path.join("multiprocessing", "pool.py")
+_KERNEL_CELL = os.sep + "ipykernel_"
 # The recorder that is recording in this process, if any.
 ACTIVE: "Recorder | None" = None
 _MAX_PENDING_HANDLED = 1000
@@ -296,6 +297,7 @@ class Recorder:
         self._last_write = self._t0
         self._ck_call = 0  # the highest call id already in a checkpoint
         self._base: int | None = None  # see _MP_BOOTSTRAP
+        self._cells_noted = False
         # asyncio tasks: id(task) -> the number we gave it. A weak reference
         # forgets the task when it is gone, so a reused id() gets a new number.
         self._aio: Any = None
@@ -794,7 +796,19 @@ class Recorder:
             return any(path == p or path.startswith(p + os.sep) for p in self._only)
         if path.startswith((_PACKAGE_DIR, _STDLIB_DIR)):
             return False
-        return not any(mark in path for mark in _SITE_MARKS)
+        if any(mark in path for mark in _SITE_MARKS):
+            return False
+        if not self._cells_noted and _KERNEL_CELL in path and path.endswith(".py"):
+            # A Jupyter kernel compiles each cell under a temporary file name.
+            self._cells_noted = True
+            self._note(
+                "which notebook cell a call is in",
+                "the kernel gives every cell a temporary file name "
+                f"(...{_KERNEL_CELL}<pid>{os.sep}<number>.py); calls and exceptions "
+                "are recorded under that name, not under the cell's number, and "
+                "the file is gone when the kernel stops",
+            )
+        return True
 
     def _task(self) -> int | None:
         """The number of the asyncio task that is running here, if any."""
