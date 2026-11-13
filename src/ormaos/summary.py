@@ -66,11 +66,49 @@ def _first_line(recording: Recording) -> str:
         _plural(len(recording.calls), "call"),
         _plural(len(exceptions), "exception"),
     ]
-    tail = f" ({swallowed} swallowed)" if exceptions else ""
+    inside = [f"{swallowed} swallowed", *taken_counts(exceptions)]
+    tail = f" ({', '.join(inside)})" if exceptions else ""
     events = sum(int(event.get("n", 1)) for event in recording.io)
     if events:
         tail += f", {events} io"
     return f"{head}: {', '.join(counts)}{tail}"
+
+
+TAKEN = "taken_by_interpreter"
+
+
+def taken_phrase(how: Any) -> str:
+    """How an exception ended that the interpreter took without a handler."""
+    if how in ("await", "yield from"):
+        return f"ended at {how}"
+    return "taken by the interpreter"
+
+
+def taken_groups(exceptions: list[Record]) -> list[list[Record]]:
+    """The exceptions the interpreter took without a handler (the
+    `StopIteration` that ends an `await`), one group per type and origin."""
+    groups: dict[tuple[Any, Any, Any, Any], list[Record]] = {}
+    for exc in exceptions:
+        if exc.get("end") == TAKEN:
+            origin = exc.get("origin", {})
+            key = (
+                exc.get("type"),
+                exc.get("how"),
+                origin.get("file"),
+                origin.get("line"),
+            )
+            groups.setdefault(key, []).append(exc)
+    return list(groups.values())
+
+
+def taken_counts(exceptions: list[Record]) -> list[str]:
+    """`3 StopIteration ended at await`, one per type and way."""
+    counts: dict[tuple[str, str], int] = {}
+    for exc in exceptions:
+        if exc.get("end") == TAKEN:
+            key = (_short_type(str(exc.get("type"))), taken_phrase(exc.get("how")))
+            counts[key] = counts.get(key, 0) + 1
+    return [f"{count} {kind} {phrase}" for (kind, phrase), count in counts.items()]
 
 
 def swallowed_groups(exceptions: list[Record]) -> list[list[Record]]:

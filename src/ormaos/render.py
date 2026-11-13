@@ -131,12 +131,22 @@ def _exceptions(doc: Doc) -> list[str]:
     where = doc["address"]
     if doc.get("scope"):
         where += f" {doc['scope']['fn']} and the calls below it"
+    taken = doc.get("taken_by_interpreter", {})
     head = (
         f"{where}: {_plural(doc['total'], 'exception')} "
-        f"({doc['swallowed']} swallowed, {doc['uncaught']} uncaught)"
+        f"({doc['swallowed']} swallowed, {doc['uncaught']} uncaught"
+        + "".join(f", {text}" for text in taken.get("counts", []))
+        + ")"
     )
     lines = [head]
     lines.extend(_exception_line(entry) for entry in doc["exceptions"])
+    # One line per origin for what the interpreter took without a handler.
+    for group in taken.get("groups", []):
+        raised = group["raised_at"]
+        lines.append(
+            f"{group['count']}x {group['type']} {group['ended']}, at "
+            f"{_place(raised)} in {raised.get('fn')}  [{group['addresses'][0]}]"
+        )
     if doc["not_shown"]:
         lines.append(
             f"... {doc['not_shown']} more: --offset {doc['offset'] + doc['limit']}"
@@ -261,7 +271,12 @@ def _show(doc: Doc) -> list[str]:
             f": {_plural(counts['processes'], 'Python process', 'Python processes')}, "
             f"{_plural(counts['calls'], 'call')}, "
             f"{_plural(counts['exceptions'], 'exception')} "
-            f"({counts['swallowed']} swallowed, {counts['uncaught']} uncaught)"
+            f"({counts['swallowed']} swallowed, {counts['uncaught']} uncaught"
+            + "".join(
+                f", {text}"
+                for text in doc.get("taken_by_interpreter", {}).get("counts", [])
+            )
+            + ")"
         )
     else:
         head += ": no Python process recorded"
@@ -281,7 +296,18 @@ def _show(doc: Doc) -> list[str]:
             parent = proc.get("parent_process")
             how = "forked from" if proc.get("forked") else "started by"
             origin = f"{how} process {parent}" if parent else "the first"
-            end = "" if proc.get("complete") else ", no end record"
+            ended = proc.get("ended_by")
+            if proc.get("complete"):
+                end = ""
+            elif ended and ended.get("by") == "pool":
+                end = f", ended by its pool (signal {ended.get('signal')})"
+            elif ended:
+                end = (
+                    f", ended by process {ended.get('process')} "
+                    f"(signal {ended.get('signal')})"
+                )
+            else:
+                end = ", no end record"
             lines.append(
                 f"process {proc['process']}: {origin}, "
                 f"{_plural(proc['calls'], 'call')}, "

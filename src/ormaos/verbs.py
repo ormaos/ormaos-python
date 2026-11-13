@@ -14,12 +14,19 @@ from dataclasses import dataclass
 from typing import Any
 
 from ormaos.recording import ROOT, Record, Recording, load
-from ormaos.show import NotFound, find
-from ormaos.summary import display_path
+from ormaos.show import NotFound, find, taken_entry
+from ormaos.summary import (
+    TAKEN,
+    display_path,
+    taken_counts,
+    taken_groups,
+    taken_phrase,
+)
 
 VERSION = 1
 MAX_NEXT = 5
 MAX_THROUGH = 20
+MAX_TAKEN_ADDRESSES = 1000
 
 _ITEM = re.compile(r"([cei])(\d+)")
 _KINDS = {"c": "call", "e": "exception", "i": "io"}
@@ -203,6 +210,8 @@ def _status(exc: Record) -> str:
         return "replaced"
     if exc.get("end") == "handled":
         return "handled"
+    if exc.get("end") == TAKEN:
+        return taken_phrase(exc.get("how"))
     if exc.get("type") == "SystemExit":
         return "exit"  # `sys.exit()`: it ends the program, nothing handles it
     return "no handler seen"
@@ -459,7 +468,11 @@ def exceptions(
             for exc in found
             if exc.get("call_addr") in inside or exc.get("handled_addr") in inside
         ]
-    ordered = sorted(found, key=_rank)  # stable: recording order inside a rank
+    # What the interpreter took without a handler (the `StopIteration` that
+    # ends an `await`) is counted and grouped by origin, not listed one by one.
+    taken = [exc for exc in found if exc.get("end") == TAKEN]
+    listed = [exc for exc in found if exc.get("end") != TAKEN]
+    ordered = sorted(listed, key=_rank)  # stable: recording order inside a rank
     page = ordered[offset : offset + limit]
     doc = _base("exceptions", target)
     doc.update(
@@ -472,6 +485,14 @@ def exceptions(
             "offset": offset,
             "exceptions": [_exception_entry(exc, cwd) for exc in page],
             "not_shown": max(0, len(ordered) - offset - len(page)),
+            "taken_by_interpreter": {
+                "total": len(taken),
+                "counts": taken_counts(taken),
+                "groups": [
+                    taken_entry(group, cwd, MAX_TAKEN_ADDRESSES)
+                    for group in taken_groups(taken)
+                ],
+            },
         }
     )
     commands = [f"ormaos exceptions {entry['address']}" for entry in doc["exceptions"]]

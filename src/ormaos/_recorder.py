@@ -55,6 +55,11 @@ _FLUSH_AFTER_NS = 200_000_000
 # The function a multiprocessing child runs in; it ends with os._exit, which
 # skips the exit handlers, so the recording is closed when it returns.
 _MP_BOOTSTRAP = ("_bootstrap", os.sep + os.path.join("multiprocessing", "process.py"))
+# The function through which multiprocessing sends a signal to a child it
+# started (`Process.terminate`, `Process.kill`, the end of a `Pool`). The
+# parent writes down that it ended that child itself.
+_MP_SIGNAL = ("_send_signal", os.sep + os.path.join("multiprocessing", "popen_fork.py"))
+_MP_POOL = os.sep + os.path.join("multiprocessing", "pool.py")
 # The recorder that is recording in this process, if any.
 ACTIVE: "Recorder | None" = None
 _MAX_PENDING_HANDLED = 1000
@@ -647,6 +652,20 @@ class Recorder:
             finally:
                 self._owner = 0
 
+    def _flush_now(self) -> None:
+        """Write what waits, and a checkpoint, without a new record."""
+        with self._lock:
+            self._owner = _thread.get_ident()
+            try:
+                now = time.perf_counter_ns()
+                buf = self._buf
+                self._buf = []
+                self._last_write = now
+                buf.append(self._checkpoint(now))
+                self._write(buf)
+            finally:
+                self._owner = 0
+
     def _checkpoint(self, now: int) -> dict[str, Any]:
         """What is still open when a chunk is written: the calls that have
         not returned and the exceptions whose end is not known yet. If the
@@ -912,6 +931,11 @@ class Recorder:
                     # runs from now on has this call above it, or none.
                     self._base = self._top(self._thread_state().stack)
                     return None  # keep its return visible: see _py_return
+                if code.co_name == _MP_SIGNAL[0] and code.co_filename.endswith(
+                    _MP_SIGNAL[1]
+                ):
+                    self._child_signalled(sys._getframe(1))
+                    return None  # every signal is to be seen, not only the first
                 return _DISABLE
             state = self._thread_state()
             stack = state.stack
@@ -945,6 +969,11 @@ class Recorder:
                 if self._in_scope(code):
                     rec["path"] = []
             stack.append((code, rec))
+            if rec["parent"] is None or rec["parent"] == self._base:
+                # A call with no call of the user's code above it starts: a
+                # checkpoint now, so that it is known even if the process is
+                # ended before anything else is written.
+                self._flush_now()
         except Exception as err:
             self._fail(err)
         return None
@@ -967,7 +996,7 @@ class Recorder:
             if self._watching:
                 self._unwatch(id(sys._getframe(1)))
             if self._active:
-                self._absorbed(id(sys._getframe(1)))
+                self._absorbed(id(sys._getframe(1)), code)
             self._close(code, "returned", retval)
         except Exception as err:
             self._fail(err)
@@ -1005,7 +1034,7 @@ class Recorder:
             if self._watching:
                 self._unwatch(id(sys._getframe(1)))
             if self._active:
-                self._absorbed(id(sys._getframe(1)))
+                self._absorbed(id(sys._getframe(1)), code)
             entry = self._pop(code)
             if entry is not None:
                 self._suspended[id(sys._getframe(1))] = entry
@@ -1083,7 +1112,35 @@ class Recorder:
         except Exception as err:
             self._fail(err)
 
-    def _absorbed(self, frame_id: int) -> None:
+    def _child_signalled(self, frame: FrameType) -> None:
+        """This process is about to send a signal to a multiprocessing child.
+        Written at once: the child will write no end record."""
+        local = frame.f_locals
+        pid = getattr(local.get("self"), "pid", None)
+        signum = local.get("sig")
+        if type(pid) is not int or not isinstance(signum, int):
+            return
+        by = "terminate"
+        above = frame.f_back
+        for _ in range(8):
+            if above is None:
+                break
+            if above.f_code.co_filename.endswith(_MP_POOL):
+                by = "pool"
+                break
+            above = above.f_back
+        self._emit(
+            {
+                "k": "child_ended",
+                "pid": pid,
+                "signal": int(signum),
+                "by": by,
+                "t": time.perf_counter_ns() - self._t0,
+            },
+            True,
+        )
+
+    def _absorbed(self, frame_id: int, code: CodeType) -> None:
         """A frame returns or yields while an exception that was raised in it
         is still in flight there: the interpreter took it without a handler
         (the `StopIteration` that carries the result of an `await` or of a
@@ -1091,7 +1148,15 @@ class Recorder:
         for flight in list(self._active.values()):
             if flight.seen == frame_id and not flight.unwound:
                 del self._active[flight.key]
-                flight.rec["end"] = "no_handler_seen"
+                flags = code.co_flags
+                if flags & 0x380:  # coroutine, iterable coroutine, async generator
+                    how = "await"
+                elif flags & 0x20:  # generator
+                    how = "yield from"
+                else:
+                    how = "other"
+                flight.rec["end"] = "taken_by_interpreter"
+                flight.rec["how"] = how
                 self._emit(flight.rec)
 
     def _begin(

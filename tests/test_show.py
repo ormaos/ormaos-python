@@ -41,6 +41,7 @@ def test_json_out_is_written_and_stdout_is_only_the_programs(work: Workdir) -> N
         "exceptions": 3,
         "swallowed": 2,
         "uncaught": 1,
+        "taken_by_interpreter": 0,
         "io": 0,
     }
     (process,) = doc["context"]["processes"]

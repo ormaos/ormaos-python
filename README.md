@@ -49,6 +49,19 @@ with (
 
 The block is recorded into `.ormaos/` like a run, with the Python processes started inside it, and is read with the same commands. Only what runs inside the block is recorded. If the recording cannot start, the block runs unrecorded and nothing is raised; an exception of the block goes through unchanged. Under `ormaos run`, the block is part of that recording. While the block runs, `ORMAOS_DIR`, `ORMAOS_PATH` and `ORMAOS_IO` are set in the environment (that is how child processes find the recording) and put back after.
 
+### The `StopIteration` of an `await`
+
+When an `await` of a future finishes (`await asyncio.gather(...)`, `await asyncio.sleep(1)`), Python raises a `StopIteration` inside the coroutine to hand over the result, and takes it itself: no `except` ever sees it. Ormaos records each one, counts them apart and groups them by the line of the `await`:
+
+```
+r1: 16 exceptions (11 swallowed, 0 uncaught, 5 StopIteration ended at await)
+r1:e1 swallowed ValueError  raised at app.py:6  handled at app.py:7 in job  task 2
+...
+3x StopIteration ended at await, at app.py:18 in main  [r1:e4]
+```
+
+With `--json`, `taken_by_interpreter` has the total, the counts and one group per origin with the address of every occurrence.
+
 ### What is there: `ormaos list` and `ormaos status`
 
 ```bash
@@ -64,7 +77,7 @@ r2  2026-11-13 11:03:33  exit 0  343.2ms  1 process, 240 calls, 6 exceptions (5 
 
 ### A process that is killed
 
-The recorder writes in chunks while the program runs: every 256 records, every 0.2 seconds (checked when a record arrives), and when a call that has no call of your code above it ends. Each chunk ends with a checkpoint: the calls that have not returned and the exceptions whose end is not known yet. So after `kill -9`, or while the program is still running, `ormaos show` reads what was written: the recording is marked `(incomplete)`, the calls that had not returned are shown as `-> open`, and `not_collected` says that the last events of that process may be missing. `multiprocessing` children end with `os._exit`; their recording is closed when their work returns. Pool workers are ended by the pool with a signal, so a recording with a pool is marked incomplete; every finished task is there.
+The recorder writes in chunks while the program runs: every 256 records, every 0.2 seconds (checked when a record arrives), and when a call that has no call of your code above it starts or ends. Each chunk ends with a checkpoint: the calls that have not returned and the exceptions whose end is not known yet. So after `kill -9`, or while the program is still running, `ormaos show` reads what was written: the recording is marked `(incomplete)`, the calls that had not returned are shown as `-> open`, and `not_collected` says that the last events of that process may be missing. `multiprocessing` children end with `os._exit`; their recording is closed when their work returns. A pool ends the workers that are still alive with a signal, and `Process.terminate()` does the same: the parent writes down that it ended that child itself, so the recording is not marked incomplete for it. `ormaos show` says `ended by its pool (signal 15)` for that process, and `not_collected` says that its end record (duration, CPU, memory) is missing and whether a call of your code was running in it. A process killed in any other way makes the recording incomplete.
 
 ### The file header
 
@@ -210,6 +223,8 @@ Shape always, value never: Ormaos records types, lengths and structure (`{"type"
 - At most 100,000 I/O events are kept per process (`ORMAOS_MAX_IO`). The same event repeated at the same line is one event with a count.
 - A process that is killed, or that ends with `os._exit`, loses the events that were not written yet: at most 256 records or what arrived in the last 0.2 seconds (see "A process that is killed"). The recording says so.
 - Thread numbers come from the thread identifier: a thread that starts after another one has ended can get the same number. Task numbers are per process.
+- `with ormaos.record():` changes the environment of the program while the block runs: it sets `ORMAOS_DIR`, `ORMAOS_PATH` and `ORMAOS_IO` in `os.environ`, and when the block ends it puts each back to the value the program had, or removes it if it had none. A program that reads those names inside the block sees Ormaos's values. Every recording of a block says so in `not_collected`.
+- `ormaos run` waits up to one second, after the command has ended, for Python processes of the recording that are still alive (a `multiprocessing` fork server), before it prints the summary.
 - `with ormaos.record():` records the calls made inside the block; the function that contains the block is not a call of the recording. In a notebook, the cells are your code when their name is `<ipython-input-...>` or a file outside `site-packages`; this was tested with code compiled under such a name, not inside Jupyter.
 - Tested on Linux only.
 

@@ -104,6 +104,30 @@ def _wait(proc: subprocess.Popen[bytes]) -> int:
             signal.signal(signum, handler)
 
 
+def _let_children_end(directory: str, patience: float = 1.0) -> None:
+    """The command has ended. A Python process it started may take a moment
+    more to end (a multiprocessing fork server, a child that was not waited
+    for). Wait a little for the ones that are still alive, so that the
+    summary does not call the recording incomplete because of them."""
+    deadline = time.monotonic() + patience
+    try:
+        while time.monotonic() < deadline:
+            waiting = False
+            for proc in load(directory).processes:
+                pid = proc.header.get("pid")
+                if proc.end is None and proc.ended_by is None and isinstance(pid, int):
+                    try:
+                        os.kill(pid, 0)
+                        waiting = True
+                    except OSError:
+                        pass
+            if not waiting:
+                return
+            time.sleep(0.02)
+    except Exception:
+        pass
+
+
 def run(
     command: Sequence[str],
     json_out: str | None = None,
@@ -153,6 +177,8 @@ def run(
         return code
 
     code, signum = _exit_code(_wait(proc))
+    if directory:
+        _let_children_end(directory)
 
     if directory:
         try:

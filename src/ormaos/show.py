@@ -9,7 +9,14 @@ import os
 from typing import Any
 
 from ormaos.recording import FORMAT, ROOT, Process, Record, Recording, recording_numbers
-from ormaos.summary import display_path, swallowed_groups
+from ormaos.summary import (
+    TAKEN,
+    display_path,
+    swallowed_groups,
+    taken_counts,
+    taken_groups,
+    taken_phrase,
+)
 
 VERSION = 1
 MAX_GROUPS = 10
@@ -69,6 +76,7 @@ def _process(proc: Process) -> dict[str, Any]:
         "executable": header.get("executable"),
         "argv": header.get("argv"),
         "complete": proc.end is not None,
+        "ended_by": proc.ended_by,
         "written_until_s": _seconds(proc.written_until),
         "duration_s": _seconds(end.get("dur")),
         "cpu_user_s": end.get("cpu_user"),
@@ -79,6 +87,19 @@ def _process(proc: Process) -> dict[str, Any]:
         "tasks": len({call["task"] for call in proc.calls if "task" in call}),
         "calls": len(proc.calls),
         "exceptions": len(proc.exceptions),
+    }
+
+
+def taken_entry(group: list[Record], cwd: str, addresses: int) -> dict[str, Any]:
+    """One origin of exceptions that the interpreter took without a handler."""
+    first = group[0]
+    return {
+        "type": first.get("type"),
+        "how": first.get("how"),
+        "ended": taken_phrase(first.get("how")),
+        "count": len(group),
+        "raised_at": _where(first.get("origin", {}), cwd),
+        "addresses": [exc["addr"] for exc in group[:addresses]],
     }
 
 
@@ -164,7 +185,17 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
             "exceptions": len(exceptions),
             "swallowed": sum(1 for exc in exceptions if exc.get("swallowed")),
             "uncaught": len(uncaught),
+            "taken_by_interpreter": sum(
+                1 for exc in exceptions if exc.get("end") == TAKEN
+            ),
             "io": sum(io_by_kind.values()),
+        },
+        "taken_by_interpreter": {
+            "counts": taken_counts(exceptions),
+            "groups": [
+                taken_entry(group, cwd, MAX_ADDRESSES)
+                for group in taken_groups(exceptions)[:MAX_GROUPS]
+            ],
         },
         "io": io_by_kind,
         "swallowed": [_swallowed(group, cwd) for group in groups[:MAX_GROUPS]],
