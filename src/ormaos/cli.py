@@ -192,6 +192,40 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="show at most N differences of each kind (default 20)",
     )
+    listing = commands.add_parser(
+        "list",
+        help="list the recordings, newest first",
+        description=(
+            "Lists the recordings in .ormaos/, newest first: when, how it ended, "
+            "how long, the counts, the command. A recording whose process was "
+            "killed or is still running is marked."
+        ),
+    )
+    listing.add_argument("--json", action="store_true", help="print JSON on stdout")
+    listing.add_argument(
+        "--limit",
+        type=_positive,
+        default=10,
+        metavar="N",
+        help="show at most N recordings (default 10)",
+    )
+    listing.add_argument(
+        "--offset",
+        type=_not_negative,
+        default=0,
+        metavar="N",
+        help="skip the N newest recordings",
+    )
+    status = commands.add_parser(
+        "status",
+        help="what ormaos can do here, and what is in .ormaos/ now",
+        description=(
+            "Shows the version, whether this Python can record, whether a "
+            "recording is running now, how many recordings there are, the last "
+            "one, and the ones left incomplete."
+        ),
+    )
+    status.add_argument("--json", action="store_true", help="print JSON on stdout")
     guide = commands.add_parser(
         "guide",
         help="how to use ormaos, for a coding agent (start here)",
@@ -354,5 +388,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _diff(args)
     if args.verb == "guide":
         return _guide(args, parser)
+    if args.verb == "list":
+        from ormaos.listing import list_document
+
+        return _answer(lambda: list_document(args.limit, args.offset), args.json)
+    if args.verb == "status":
+        from ormaos.listing import status_document
+
+        return _answer(status_document, args.json)
     parser.print_help()
     return 0

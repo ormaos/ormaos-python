@@ -22,6 +22,15 @@ It records shapes, never values: types, lengths and structure of arguments and r
    ormaos run -- python job.py
    ```
 
+   In a script or a notebook, where there is no command to put it in front of, record a block instead:
+
+   ```python
+   import ormaos
+
+   with ormaos.record():
+       main()
+   ```
+
    The command runs unchanged, with the same output and the same exit code. Ormaos then prints a summary on stderr: at most 5 lines, each starting with `ormaos:`. The recording is saved in `.ormaos/`.
 
 2. **Read the summary.** It names the recording (`r1`), the counts, the swallowed and the uncaught exceptions, and ends with addresses. `ormaos show` prints the overview again, with more detail.
@@ -52,6 +61,8 @@ An address belongs to one recording: `r3:c42` and `r4:c42` are not the same call
 | `ormaos io <addr>` | SQL statements, files, subprocesses and HTTP requests of a recording or a call, grouped by the line of code that caused them, with counts. For one I/O event: where it happened. |
 | `ormaos path <addr>` | The lines a call ran, in order, with the calls it made and the exceptions it caught in between. |
 | `ormaos diff r3 r4` | What two recordings did differently: calls, exceptions and I/O that one has and the other has not, or has more of. Matched by file, function and line of the code and by order, never by address. |
+| `ormaos list` | The recordings in `.ormaos/`, newest first: when, how each ended, the counts, the command. A run that was killed or is still running is marked; it is read as far as it was written. |
+| `ormaos status` | What works here: the version, whether this Python can record, whether something is being recorded now, the last recording, the incomplete ones. |
 
 Options on every verb: `--json` (one JSON document on stdout, also for errors, with `kind`, `version`, `next` and `next_commands`). On `tree`, `exceptions`, `path` and `io`: `--limit N` and `--offset N`. On `tree`: `--depth N`. On `io`: `--kind sqlite|file|subprocess|http`.
 

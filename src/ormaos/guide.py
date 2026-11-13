@@ -16,12 +16,11 @@ WHEN TO USE IT
 - You want to see what ran: the project's calls with the shape of their
   arguments, every exception (also the caught ones), the SQL statements,
   files, subprocesses and HTTP requests.
-- Not for reading values: only types, lengths and structure are recorded.
 
 WHERE TO START
 1. Record:  ormaos run -- <command>
-   The command runs unchanged: same output, same exit code. The Python it
-   starts must have ormaos installed in its environment.
+   The command runs unchanged (same output, same exit code); its Python must
+   have ormaos installed. In a script or notebook: `with ormaos.record():`.
 2. Read the summary printed on stderr: at most 5 lines, each starting with
    "ormaos:". To see it again, with more: ormaos show
 3. Run the commands of the `next:` line. Reading never runs the program.
@@ -42,13 +41,14 @@ ends with `next:`, the commands for the next question.
                             made with `ormaos run --path file.py:function --
                             <command>` (the program runs again; see the error)
   ormaos diff r3 r4         what r4 did differently from r3, by place in code
+  ormaos list               the recordings, newest first; killed: "incomplete"
+  ormaos status             what works here, and what is being recorded now
 An exception address given to tree, io or path means the call that handled it.
 Exceptions are: "swallowed" (entered an `except`, not raised again; "handled
 at" is the line of that `except`), "uncaught" (ended the program), "replaced"
 (another was raised from its handler), "exit" (a SystemExit, as sys.exit()).
-Options: --json (one JSON document on stdout, also for errors), --limit N
-(more lines), --offset N (skip entries; for tree: calls directly below the
-address); tree: --depth N; io: --kind sqlite|file|subprocess|http.
+Options: --json (one JSON document, also for errors), --limit N, --offset N
+(skip entries); tree: --depth N; io: --kind sqlite|file|subprocess|http.
 
 WHAT IS NOT RECORDED
 - Values: arguments, results, exception messages, environment values, SQL
