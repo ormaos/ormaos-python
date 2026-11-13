@@ -16,6 +16,7 @@ from types import FrameType
 from typing import Any
 
 from ormaos import __version__
+from ormaos._command import shape_command
 from ormaos.recording import FORMAT, ROOT, load, recording_numbers
 from ormaos.show import document
 from ormaos.summary import PREFIX, summarize
@@ -146,7 +147,8 @@ def run(
     try:
         directory = os.path.abspath(new_recording(ROOT))
         run_file = os.path.join(directory, "run.jsonl")
-        append(run_file, run_header(list(command), cwd, sorted(env), "run"))
+        # Names, never values: see `_command`.
+        append(run_file, run_header(shape_command(command), cwd, sorted(env), "run"))
         env["ORMAOS_DIR"] = directory
     except Exception as err:
         directory = None

@@ -520,9 +520,15 @@ def _source(file: str) -> list[str]:
 
 
 def _record_command(recording: Recording, scope: str) -> str:
+    # The recorded command has `<str[N]>` where a value was: the values are
+    # for the reader to put back.
     command = recording.header.get("command")
-    tail = shlex.join(str(part) for part in command) if command else "<command>"
+    tail = " ".join(_word(str(part)) for part in command) if command else "<command>"
     return f"ormaos run --path {scope} -- {tail}"
+
+
+def _word(part: str) -> str:
+    return part if "<str[" in part else shlex.quote(part)
 
 
 def _scope_of(call: Record, cwd: str) -> str:
