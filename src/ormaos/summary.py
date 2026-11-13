@@ -41,8 +41,12 @@ def _place(where: dict[str, Any], cwd: str) -> str:
 def _first_line(recording: Recording) -> str:
     end = recording.end or {}
     parts = [recording.name]
+    if not recording.complete:
+        parts.append("(incomplete)")
     code = end.get("exit_code")
-    if code is None:
+    if recording.header.get("mode") == "record" and recording.end is not None:
+        parts.append("record() block")
+    elif code is None:
         parts.append("no exit code")
     elif end.get("signal"):
         parts.append(f"exit {code} (signal {end['signal']})")

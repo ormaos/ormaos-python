@@ -58,18 +58,25 @@ def _process(proc: Process) -> dict[str, Any]:
     end = proc.end or {}
     return {
         "process": proc.index,
+        "parent_process": proc.parent,
         "pid": header.get("pid"),
         "ppid": header.get("ppid"),
         "forked": header.get("forked"),
+        "started_by": header.get("started_by"),
+        "started": header.get("started"),
+        "capabilities": header.get("capabilities"),
         "python": header.get("python"),
         "executable": header.get("executable"),
         "argv": header.get("argv"),
         "complete": proc.end is not None,
+        "written_until_s": _seconds(proc.written_until),
         "duration_s": _seconds(end.get("dur")),
         "cpu_user_s": end.get("cpu_user"),
         "cpu_system_s": end.get("cpu_system"),
         "max_rss_kb": end.get("max_rss_kb"),
-        "threads": end.get("threads"),
+        "threads": end.get("threads")
+        or len({call.get("thread") for call in proc.calls}),
+        "tasks": len({call["task"] for call in proc.calls if "task" in call}),
         "calls": len(proc.calls),
         "exceptions": len(proc.exceptions),
     }
@@ -134,7 +141,10 @@ def document(recording: Recording, cwd: str = "") -> dict[str, Any]:
         "format": FORMAT,
         "recording": recording.name,
         "path": display_path(recording.path, cwd),
+        "complete": recording.complete,
+        "incomplete": recording.incomplete_reasons,
         "context": {
+            "mode": header.get("mode", "run"),
             "command": header.get("command"),
             "cwd": header.get("cwd"),
             "env_names": header.get("env_names"),

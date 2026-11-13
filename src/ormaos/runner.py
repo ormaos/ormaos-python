@@ -28,12 +28,12 @@ def _say(message: str) -> None:
         pass
 
 
-def _append(path: str, record: dict[str, Any]) -> None:
+def append(path: str, record: dict[str, Any]) -> None:
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
-def _new_recording(root: str) -> str:
+def new_recording(root: str) -> str:
     """Create ``<root>/r<N>`` with the next free number and return its path."""
     os.makedirs(root, exist_ok=True)
     ignore = os.path.join(root, ".gitignore")
@@ -48,6 +48,27 @@ def _new_recording(root: str) -> str:
             return path
         except FileExistsError:
             number += 1
+
+
+def run_header(
+    command: list[str], cwd: str, env_names: list[str], mode: str
+) -> dict[str, Any]:
+    """The first line of ``run.jsonl``. ``mode`` is ``run`` for ``ormaos run``
+    and ``record`` for ``with ormaos.record():``."""
+    return {
+        "format": FORMAT,
+        "kind": "run",
+        "core": {
+            "ormaos": __version__,
+            "mode": mode,
+            "pid": os.getpid(),
+            "command": command,
+            "cwd": cwd,
+            "env_names": env_names,
+            "platform": sys.platform,
+            "anchor": {"t": 0, "unix": time.time(), "clock": "monotonic, nanoseconds"},
+        },
+    }
 
 
 def _exit_code(returncode: int) -> tuple[int, int | None]:
@@ -99,21 +120,9 @@ def run(
     directory: str | None = None
     run_file = ""
     try:
-        directory = os.path.abspath(_new_recording(ROOT))
+        directory = os.path.abspath(new_recording(ROOT))
         run_file = os.path.join(directory, "run.jsonl")
-        _append(
-            run_file,
-            {
-                "format": FORMAT,
-                "kind": "run",
-                "ormaos": __version__,
-                "command": list(command),
-                "cwd": cwd,
-                "env_names": sorted(env),
-                "platform": sys.platform,
-                "started": time.time(),
-            },
-        )
+        append(run_file, run_header(list(command), cwd, sorted(env), "run"))
         env["ORMAOS_DIR"] = directory
     except Exception as err:
         directory = None
@@ -129,7 +138,7 @@ def run(
         _say(f"cannot start {command[0]!r} ({type(err).__name__})")
         if directory:
             try:
-                _append(
+                append(
                     run_file,
                     {
                         "k": "not_collected",
@@ -138,7 +147,7 @@ def run(
                         f"({type(err).__name__})",
                     },
                 )
-                _append(run_file, {"k": "end", "exit_code": code, "signal": None})
+                append(run_file, {"k": "end", "exit_code": code, "signal": None})
             except Exception:
                 pass
         return code
@@ -163,7 +172,7 @@ def run(
                 end["max_rss_kb"] = rss // 1024 if sys.platform == "darwin" else rss
             except Exception:
                 pass
-            _append(run_file, end)
+            append(run_file, end)
             recording = load(directory)
             for line in summarize(recording, cwd):
                 print(line, file=sys.stderr)

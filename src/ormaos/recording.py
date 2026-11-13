@@ -1,8 +1,19 @@
 """Read a recording from disk.
 
 A recording is a directory ``.ormaos/r<N>/`` with one ``run.jsonl`` (written
-by ``ormaos run``) and one ``p<pid>-<time>.jsonl`` per Python process. Every
-file starts with a header line carrying ``"format": "provisional-0"``.
+by ``ormaos run`` or by ``with ormaos.record():``) and one
+``p<pid>-<time>.jsonl`` per Python process. Every file starts with a header
+line carrying ``"format": "provisional-0"``.
+
+The header has a part named ``core`` (what any recorder writes: the process
+or the command, the capabilities recorded, the wall-clock anchor of the event
+times) and, in a process file, a part named ``python``. Here both are read
+into one flat mapping, ``header``; the file's own line stays in ``raw``.
+
+A process that was killed has no end record. Its file is still read: the
+records are written in chunks, and each chunk ends with a checkpoint that
+lists what was open then. The calls and exceptions of the checkpoints that
+never got their final record are added as they were last written.
 
 Addresses (``r3:c42``, ``r3:e5``, ``r3:i7``) are given here, at read time:
 processes in start order, then records in the order they were created in each
@@ -28,6 +39,9 @@ class Process:
     index: int
     path: str
     header: Record
+    raw: Record = field(default_factory=dict)
+    parent: int | None = None  # the index of the process that started it
+    written_until: int | None = None  # `t` of the last checkpoint
     calls: list[Record] = field(default_factory=list)
     exceptions: list[Record] = field(default_factory=list)
     io: list[Record] = field(default_factory=list)
@@ -47,6 +61,25 @@ class Recording:
     @property
     def name(self) -> str:
         return f"r{self.number}"
+
+    @property
+    def complete(self) -> bool:
+        """The run and every process wrote their end record."""
+        return self.end is not None and all(
+            proc.end is not None for proc in self.processes
+        )
+
+    @property
+    def incomplete_reasons(self) -> list[str]:
+        reasons = []
+        if self.end is None:
+            reasons.append("the run has no end record")
+        open_ = [proc.index for proc in self.processes if proc.end is None]
+        if open_:
+            numbers = ", ".join(str(index) for index in open_)
+            word = "process" if len(open_) == 1 else "processes"
+            reasons.append(f"{word} {numbers} wrote no end record")
+        return reasons
 
     @property
     def calls(self) -> list[Record]:
@@ -94,6 +127,48 @@ def _read_lines(path: str) -> tuple[list[Record], int]:
     return records, bad
 
 
+def flat_header(raw: Record) -> Record:
+    """One mapping from a header with `core` and `python` parts. A header
+    written before the split is already flat and comes back unchanged."""
+    core = raw.get("core")
+    if not isinstance(core, dict):
+        return raw
+    flat = {key: value for key, value in raw.items() if key not in ("core", "python")}
+    flat.update(core)
+    anchor = core.get("anchor")
+    if isinstance(anchor, dict):
+        flat["started"] = anchor.get("unix")
+    profile = raw.get("python")
+    if isinstance(profile, dict):
+        flat.update({key: value for key, value in profile.items() if key != "version"})
+        flat["python"] = profile.get("version")
+    return flat
+
+
+def _from_checkpoints(proc: Process, checkpoints: list[Record]) -> None:
+    """Finish a file that has no end record, the way the recorder would have:
+    a call that had not returned is `open`, an exception that was in a handler
+    is `handled`, one still in flight has no handler seen."""
+    done_calls = {call.get("id") for call in proc.calls}
+    done_exceptions = {exc.get("id") for exc in proc.exceptions}
+    open_exceptions: dict[Any, Record] = {}
+    for point in checkpoints:
+        for call in point.get("calls", []):
+            if isinstance(call, dict) and call.get("id") not in done_calls:
+                done_calls.add(call.get("id"))
+                proc.calls.append({**call, "out": "open"})
+        for exc in point.get("exceptions", []):
+            if isinstance(exc, dict) and exc.get("id") not in done_exceptions:
+                open_exceptions[exc.get("id")] = exc
+    for exc in open_exceptions.values():
+        if "handled" in exc:
+            exc.setdefault("swallowed", True)
+            exc["end"] = "handled"
+        else:
+            exc["end"] = "no_handler_seen"
+        proc.exceptions.append(exc)
+
+
 def _note(what: str, reason: str) -> Record:
     return {"k": "not_collected", "what": what, "reason": reason}
 
@@ -101,9 +176,12 @@ def _note(what: str, reason: str) -> Record:
 def _load_process(path: str) -> Process:
     records, bad = _read_lines(path)
     header: Record = {}
+    raw: Record = {}
     if records and records[0].get("kind") == "process":
-        header = records.pop(0)
-    proc = Process(index=0, path=path, header=header)
+        raw = records.pop(0)
+        header = flat_header(raw)
+    proc = Process(index=0, path=path, header=header, raw=raw)
+    checkpoints: list[Record] = []
     name = os.path.basename(path)
     if not header:
         proc.not_collected.append(_note(f"header of {name}", "the file has no header"))
@@ -119,6 +197,12 @@ def _load_process(path: str) -> Process:
             proc.not_collected.append(rec)
         elif kind == "end":
             proc.end = rec
+        elif kind == "checkpoint":
+            checkpoints.append(rec)
+    if checkpoints and isinstance(checkpoints[-1].get("t"), int):
+        proc.written_until = checkpoints[-1]["t"]
+    if proc.end is None:
+        _from_checkpoints(proc, checkpoints)
     if bad:
         proc.not_collected.append(
             _note(f"{bad} lines of {name}", "the lines are not valid JSON")
@@ -128,7 +212,8 @@ def _load_process(path: str) -> Process:
             _note(
                 f"the last events of process {header.get('pid', '?')}",
                 "the process ended without running its exit handlers "
-                "(killed, os._exit, or still running)",
+                "(killed, os._exit, or still running); what it had written "
+                "is here, and the calls that had not returned are marked open",
             )
         )
     proc.calls.sort(key=lambda rec: rec.get("id", 0))
@@ -151,6 +236,21 @@ def _path(steps: Any, call_addr: dict[Any, str], exc_addr: dict[Any, str]) -> li
     return out
 
 
+def _link(processes: list[Process]) -> None:
+    """Give every process the index of the recorded process that started it:
+    the one whose pid is its parent pid, the latest that started before it."""
+    for index, proc in enumerate(processes, start=1):
+        proc.index = index
+    for proc in processes:
+        ppid = proc.header.get("ppid")
+        started = proc.header.get("started") or 0.0
+        for other in processes:
+            if other is proc or other.header.get("pid") != ppid:
+                continue
+            if (other.header.get("started") or 0.0) <= started:
+                proc.parent = other.index
+
+
 def load(path: str) -> Recording:
     match = _DIR_NAME.fullmatch(os.path.basename(os.path.normpath(path)))
     number = int(match.group(1)) if match else 0
@@ -160,7 +260,7 @@ def load(path: str) -> Recording:
         records, _bad = _read_lines(run_path)
         for rec in records:
             if rec.get("kind") == "run":
-                recording.header = rec
+                recording.header = flat_header(rec)
             elif rec.get("k") == "end":
                 recording.end = rec
             elif rec.get("k") == "not_collected":
@@ -173,6 +273,7 @@ def load(path: str) -> Recording:
     processes.sort(
         key=lambda p: (p.header.get("started", 0.0), p.header.get("pid", 0), p.path)
     )
+    _link(processes)
     prefix = recording.name
     call_n = 0
     exc_n = 0

@@ -625,6 +625,9 @@ class IoRecorder:
             "thread": state.index,
             "t": time.perf_counter_ns() - recorder._t0,
         }
+        task = recorder._task()
+        if task is not None:
+            rec["task"] = task
         if repeat:
             rec["n"] = 1
             self._held[ident] = (sig, rec)

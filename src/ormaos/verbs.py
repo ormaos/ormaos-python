@@ -220,6 +220,8 @@ def _node(ix: Index, call: Record, cwd: str, depth: int) -> dict[str, Any]:
         "process": call.get("process"),
         "calls_below": len(ix.children.get(addr, [])),
     }
+    if "task" in call:
+        node["task"] = call["task"]
     if "ret" in call:
         node["ret"] = call["ret"]
     groups: dict[tuple[Any, str], list[Record]] = {}
@@ -347,6 +349,13 @@ def tree(
 
 def _exception_entry(exc: Record, cwd: str) -> dict[str, Any]:
     handled = exc.get("handled")
+    entry = _exception_fields(exc, cwd, handled)
+    if "task" in exc:
+        entry["task"] = exc["task"]
+    return entry
+
+
+def _exception_fields(exc: Record, cwd: str, handled: Any) -> dict[str, Any]:
     return {
         "address": exc["addr"],
         "type": exc.get("type"),
@@ -704,6 +713,8 @@ def _io_detail(target: Target, ix: Index, cwd: str) -> dict[str, Any]:
     doc["t_s"] = _seconds(event.get("t"))
     doc["thread"] = event.get("thread")
     doc["process"] = event.get("process")
+    if "task" in event:
+        doc["task"] = event["task"]
     call = ix.calls.get(event.get("call_addr") or "")
     doc["call"] = _brief(call, cwd) if call is not None else None
     doc["inside"] = (

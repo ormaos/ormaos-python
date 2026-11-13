@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from _weakref import ref as _weakref
 from types import CodeType, FrameType, ModuleType
 from typing import Any
 
@@ -45,7 +46,17 @@ _USER_PSEUDO_FILES = ("<string>", "<stdin>")
 # Library functions whose start and return the I/O recorder looks at.
 _IO_NAMES = frozenset({"getresponse", "_send_single_request"})
 
+# A chunk is written when this many records wait, when the oldest has waited
+# this long (checked when the next record arrives), and when a call that has
+# no call of the user's code above it ends. A process that is killed loses at
+# most what was waiting.
 _FLUSH_EVERY = 256
+_FLUSH_AFTER_NS = 200_000_000
+# The function a multiprocessing child runs in; it ends with os._exit, which
+# skips the exit handlers, so the recording is closed when it returns.
+_MP_BOOTSTRAP = ("_bootstrap", os.sep + os.path.join("multiprocessing", "process.py"))
+# The recorder that is recording in this process, if any.
+ACTIVE: "Recorder | None" = None
 _MAX_PENDING_HANDLED = 1000
 _MAX_CLAUSES = 64
 _MAX_PLACE_NOTES = 20
@@ -80,12 +91,13 @@ type _Call = dict[str, Any] | None
 # One `except` clause: first offset, last offset, line.
 type _Clause = tuple[int, int, int]
 type _Entry = tuple[CodeType, _Call]
+_OPEN_CALL_KEYS = ("k", "id", "parent", "fn", "file", "line", "thread", "t", "args")
 
 
 class _Flight:
     """One exception, from the first time we see it until it is handled."""
 
-    __slots__ = ("during", "frame", "key", "rec", "unwound")
+    __slots__ = ("during", "frame", "key", "rec", "unwound", "written")
 
     def __init__(self, key: int, rec: dict[str, Any]) -> None:
         self.key = key  # id() of the exception object
@@ -93,6 +105,7 @@ class _Flight:
         self.unwound = 0  # id() of the last frame it left, 0 if none yet
         self.frame = 0  # id() of the frame whose handler caught it
         self.during: _Flight | None = None  # the exception being handled
+        self.written = 0  # in the last checkpoint: 1 as in flight, 2 as handled
 
 
 class _ThreadState:
@@ -252,8 +265,15 @@ def _handler_line(code: CodeType, offset: int, fallback: int) -> int:
 
 
 class Recorder:
-    def __init__(self, directory: str) -> None:
+    def __init__(
+        self,
+        directory: str,
+        scopes: list[str] | None = None,
+        io: bool | None = None,
+        started_by: str = "run",
+    ) -> None:
         self._dir = directory
+        self._started_by = started_by
         self._lock = _thread.allocate_lock()
         self._buf: list[dict[str, Any]] = []
         self._fd = -1
@@ -266,7 +286,16 @@ class Recorder:
         # I/O events that this writing causes itself are not recorded.
         self._owner = 0
         self._io: Any = None
-        self._io_on = os.environ.get("ORMAOS_IO", "1") != "0"
+        self._io_on = os.environ.get("ORMAOS_IO", "1") != "0" if io is None else io
+        self._last_write = self._t0
+        self._ck_call = 0  # the highest call id already in a checkpoint
+        self._base: int | None = None  # see _MP_BOOTSTRAP
+        # asyncio tasks: id(task) -> the number we gave it. A weak reference
+        # forgets the task when it is gone, so a reused id() gets a new number.
+        self._aio: Any = None
+        self._tasks: dict[int, int] = {}
+        self._task_refs: dict[int, Any] = {}
+        self._ntasks = 0
         self._user_files: dict[str, bool] = {}
         self._threads: dict[int, _ThreadState] = {}
         self._suspended: dict[int, _Entry] = {}
@@ -286,11 +315,9 @@ class Recorder:
         self._calls_capped = False
         self._exc_capped = False
         # Line-by-line recording, only inside the scopes of ORMAOS_PATH.
-        self._scope_text = [
-            part.strip()
-            for part in os.environ.get("ORMAOS_PATH", "").split(",")
-            if part.strip()
-        ]
+        if scopes is None:
+            scopes = os.environ.get("ORMAOS_PATH", "").split(",")
+        self._scope_text = [part.strip() for part in scopes if part.strip()]
         self._scopes = [_parse_scope(part) for part in self._scope_text]
         self._scope_known: dict[tuple[str, str], bool] = {}
         self._path_codes: set[CodeType] = set()
@@ -307,8 +334,10 @@ class Recorder:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
+        global ACTIVE
         try:
             self._open(forked=False)
+            ACTIVE = self
             atexit.register(self.finish)
             if hasattr(os, "register_at_fork"):
                 os.register_at_fork(after_in_child=self._after_fork)
@@ -390,23 +419,38 @@ class Recorder:
         path = os.path.join(self._dir, f"p{self._pid}-{time.time_ns()}.jsonl")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
         self._fd = os.open(path, flags, 0o600)
+        # The header has two parts. `core` is what any recorder of any
+        # language would write: the process, the capabilities recorded, what
+        # is never recorded, and the anchor that ties the event times (`t`,
+        # nanoseconds on a monotonic clock) to the wall clock. `python` is
+        # what only this recorder knows.
+        since = time.perf_counter_ns() - self._t0
         self._write(
             [
                 {
                     "format": FORMAT,
                     "kind": "process",
-                    "pid": self._pid,
-                    "ppid": os.getppid(),
-                    "forked": forked,
-                    "python": ".".join(str(n) for n in sys.version_info[:3]),
-                    "implementation": sys.implementation.name,
-                    "executable": sys.executable,
-                    "argv": _argv_shape(),
-                    "cwd": os.getcwd(),
-                    "started": time.time(),
-                    "capabilities": self._capabilities(),
-                    "path_scope": self._scope_text,
-                    "not_collected": self._always_not_collected(),
+                    "core": {
+                        "pid": self._pid,
+                        "ppid": os.getppid(),
+                        "cwd": os.getcwd(),
+                        "anchor": {
+                            "t": 0,
+                            "unix": time.time() - since / 1e9,
+                            "clock": "monotonic, nanoseconds",
+                        },
+                        "capabilities": self._capabilities(),
+                        "not_collected": self._always_not_collected(),
+                    },
+                    "python": {
+                        "version": ".".join(str(n) for n in sys.version_info[:3]),
+                        "implementation": sys.implementation.name,
+                        "executable": sys.executable,
+                        "argv": _argv_shape(),
+                        "forked": forked,
+                        "started_by": self._started_by,
+                        "path_scope": self._scope_text,
+                    },
                 }
             ]
         )
@@ -457,7 +501,11 @@ class Recorder:
             if self._io is not None:
                 self._io.reset()
             self._nexc = 0
+            self._tasks = {}
+            self._task_refs = {}
+            self._ck_call = 0
             self._t0 = time.perf_counter_ns()
+            self._last_write = self._t0
             if self._fd >= 0:
                 os.close(self._fd)
                 self._fd = -1
@@ -467,9 +515,12 @@ class Recorder:
 
     def finish(self) -> None:
         """Write what is still open, and the end record. Runs at exit."""
+        global ACTIVE
         if self._finished or os.getpid() != self._pid:
             return
         self._finished = True
+        if ACTIVE is self:
+            ACTIVE = None
         try:
             self._stop()
         except Exception:
@@ -492,6 +543,18 @@ class Recorder:
                 self._fd = -1
         except Exception:
             pass
+
+    def block_left(self, exc: BaseException) -> None:
+        """An exception is leaving a `with ormaos.record():` block. The `with`
+        statement reported it as handled; it goes on, so it is in flight."""
+        try:
+            flight = self._handled.pop(id(exc), None)
+            if flight is not None:
+                flight.rec.pop("handled", None)
+                flight.unwound = 0
+                self._active[id(exc)] = flight
+        except Exception as err:
+            self._fail(err)
 
     def _finish_records(self) -> None:
         if self._io is not None:
@@ -553,14 +616,21 @@ class Recorder:
         lines = [json.dumps(rec, separators=(",", ":")) for rec in records]
         self._write_out(("\n".join(lines) + "\n").encode("utf-8"))
 
-    def _emit(self, rec: dict[str, Any]) -> None:
+    def _emit(self, rec: dict[str, Any], now_too: bool = False) -> None:
         with self._lock:
             self._owner = _thread.get_ident()
             try:
                 self._buf.append(rec)
-                if len(self._buf) >= _FLUSH_EVERY:
+                now = time.perf_counter_ns()
+                if (
+                    now_too
+                    or len(self._buf) >= _FLUSH_EVERY
+                    or now - self._last_write >= _FLUSH_AFTER_NS
+                ):
                     buf = self._buf
                     self._buf = []
+                    self._last_write = now
+                    buf.append(self._checkpoint(now))
                     self._write(buf)
             finally:
                 self._owner = 0
@@ -575,6 +645,45 @@ class Recorder:
                     self._write(buf)
             finally:
                 self._owner = 0
+
+    def _checkpoint(self, now: int) -> dict[str, Any]:
+        """What is still open when a chunk is written: the calls that have
+        not returned and the exceptions whose end is not known yet. If the
+        process is killed, the reader finishes the recording from the last
+        checkpoints. Each open call is written once, each exception once per
+        state. Only copies are written: other threads own the records."""
+        calls: list[dict[str, Any]] = []
+        seen = self._ck_call
+        highest = seen
+        entries: list[_Entry] = []
+        for state in list(self._threads.values()):
+            entries.extend(list(state.stack))
+        entries.extend(list(self._suspended.values()))
+        for _code, rec in entries:
+            if rec is None or rec["id"] <= seen:
+                continue
+            highest = max(highest, rec["id"])
+            copy = {key: rec[key] for key in _OPEN_CALL_KEYS}
+            if "task" in rec:
+                copy["task"] = rec["task"]
+            calls.append(copy)
+        self._ck_call = highest
+        exceptions: list[dict[str, Any]] = []
+        for state_id, flights in ((1, self._active), (2, self._handled)):
+            for flight in list(flights.values()):
+                if flight.written != state_id:
+                    flight.written = state_id
+                    copy = dict(flight.rec)
+                    for key in ("origin", "at", "handled"):
+                        if key in copy:
+                            copy[key] = dict(copy[key])
+                    exceptions.append(copy)
+        out: dict[str, Any] = {"k": "checkpoint", "t": now - self._t0}
+        if calls:
+            out["calls"] = calls
+        if exceptions:
+            out["exceptions"] = exceptions
+        return out
 
     def _note(self, what: str, reason: str) -> None:
         self._emit({"k": "not_collected", "what": what, "reason": reason})
@@ -635,7 +744,10 @@ class Recorder:
         return known
 
     def _user_pseudo(self, filename: str, frame: FrameType) -> bool:
-        if filename not in _USER_PSEUDO_FILES:
+        # "<ipython-input-...>" is a cell of an IPython session or a notebook.
+        if filename not in _USER_PSEUDO_FILES and not filename.startswith(
+            "<ipython-input-"
+        ):
             return False
         module = dict.get(frame.f_globals, "__name__")
         if type(module) is not str:
@@ -663,6 +775,38 @@ class Recorder:
         if path.startswith((_PACKAGE_DIR, _STDLIB_DIR)):
             return False
         return not any(mark in path for mark in _SITE_MARKS)
+
+    def _task(self) -> int | None:
+        """The number of the asyncio task that is running here, if any."""
+        events = self._aio
+        if events is None:
+            events = sys.modules.get("asyncio.events")
+            if events is None:
+                return None
+            self._aio = events
+        try:
+            loop = events._get_running_loop()
+            if loop is None:
+                return None
+            task = sys.modules["asyncio.tasks"].current_task(loop)
+            if task is None:
+                return None
+            key = id(task)
+            number = self._tasks.get(key)
+            if number is None:
+                self._ntasks += 1
+                number = self._tasks[key] = self._ntasks
+                self._task_refs[key] = _weakref(task, self._task_gone(key))
+            return number
+        except Exception:
+            return None
+
+    def _task_gone(self, key: int) -> Any:
+        def forget(_ref: object) -> None:
+            self._tasks.pop(key, None)
+            self._task_refs.pop(key, None)
+
+        return forget
 
     def _thread_state(self) -> _ThreadState:
         ident = _thread.get_ident()
@@ -742,7 +886,12 @@ class Recorder:
         rec["out"] = out
         if out == "returned":
             rec["ret"] = shape(ret)
-        self._emit(rec)
+        # A call with no call of the user's code above it has ended (a thread
+        # function, a request handler), or a task of a multiprocessing worker:
+        # written right away, because such a process is often ended with a
+        # signal.
+        parent = rec["parent"]
+        self._emit(rec, parent is None or parent == self._base)
 
     # ---------------------------------------------------------------- calls
 
@@ -755,6 +904,13 @@ class Recorder:
                 if io is not None and code.co_name in _IO_NAMES and io.wants(code):
                     io.started(code, sys._getframe(1))
                     return None
+                if code.co_name == _MP_BOOTSTRAP[0] and code.co_filename.endswith(
+                    _MP_BOOTSTRAP[1]
+                ):
+                    # A multiprocessing child starts its work here. What it
+                    # runs from now on has this call above it, or none.
+                    self._base = self._top(self._thread_state().stack)
+                    return None  # keep its return visible: see _py_return
                 return _DISABLE
             state = self._thread_state()
             stack = state.stack
@@ -769,7 +925,7 @@ class Recorder:
                     )
                 return None
             self._ncalls += 1
-            rec = {
+            rec: dict[str, Any] = {
                 "k": "call",
                 "id": next(self._call_ids),
                 "parent": self._top(stack),
@@ -780,6 +936,9 @@ class Recorder:
                 "t": time.perf_counter_ns() - self._t0,
                 "args": self._args(code, sys._getframe(1)),
             }
+            task = self._task()
+            if task is not None:
+                rec["task"] = task
             if self._scopes:
                 self._mark(stack, f"c{rec['id']}")
                 if self._in_scope(code):
@@ -797,6 +956,11 @@ class Recorder:
             if not self._user(code):
                 if io is not None and code in io.watched:
                     io.returned(code, sys._getframe(1), retval)
+                    return None
+                if code.co_name == _MP_BOOTSTRAP[0] and code.co_filename.endswith(
+                    _MP_BOOTSTRAP[1]
+                ):
+                    self.finish()  # a multiprocessing child is about to exit
                     return None
                 return _DISABLE
             if self._watching:
@@ -942,6 +1106,9 @@ class Recorder:
                 "call": self._top(state.stack),
             },
         }
+        task = self._task()
+        if task is not None:
+            rec["task"] = task
         flight = _Flight(key, rec)
         if current is not None and current is not exc:
             handling = self._handled.get(id(current))

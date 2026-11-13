@@ -60,6 +60,18 @@ def _signature(node: Doc) -> str:
     return f"{node.get('fn')}({args}){tail}"
 
 
+def _who(entry: Doc) -> str:
+    """`process 2, thread 3, task 1`: only what is not the first of its kind."""
+    parts = []
+    if isinstance(entry.get("process"), int) and entry["process"] > 1:
+        parts.append(f"process {entry['process']}")
+    if isinstance(entry.get("thread"), int) and entry["thread"] > 1:
+        parts.append(f"thread {entry['thread']}")
+    if entry.get("task") is not None:
+        parts.append(f"task {entry['task']}")
+    return ", ".join(parts)
+
+
 def _node_line(node: Doc) -> str:
     parts = [
         f"{'  ' * node['depth']}{node['address']} {_signature(node)}",
@@ -70,6 +82,9 @@ def _node_line(node: Doc) -> str:
         parts.append(took)
     if node.get("io"):
         parts.append(f"io {node['io']}")
+    where = _who(node)
+    if where:
+        parts.append(where)
     for group in node.get("handled_here", []):
         parts.append(
             f"[{group['status']} {group['count']}x {group['type']}: {group['address']}]"
@@ -106,6 +121,9 @@ def _exception_line(entry: Doc) -> str:
     handled = entry.get("handled_at")
     if handled:
         line += f"  handled at {_place(handled)} in {handled.get('fn')}"
+    where = _who(entry)
+    if where:
+        line += f"  {where}"
     return line
 
 
@@ -224,8 +242,16 @@ def _show(doc: Doc) -> list[str]:
     context = doc["context"]
     counts = doc["counts"]
     head = doc["recording"]
+    if not doc.get("complete", True):
+        head += " (incomplete)"
     code = context.get("exit_code")
-    head += " no exit code" if code is None else f" exit {code}"
+    if context.get("mode") == "record" and code is None:
+        if context.get("duration_s") is not None:
+            head += " record() block"
+        else:
+            head += " record() block, not ended"
+    else:
+        head += " no exit code" if code is None else f" exit {code}"
     if context.get("signal"):
         head += f" (signal {context['signal']})"
     if context.get("duration_s") is not None:
@@ -240,9 +266,27 @@ def _show(doc: Doc) -> list[str]:
     else:
         head += ": no Python process recorded"
     lines = [head]
+    if doc.get("incomplete"):
+        lines.append(
+            "incomplete: "
+            + "; ".join(doc["incomplete"])
+            + " (killed, or still running): shown as far as it was written"
+        )
     command = context.get("command")
     if command:
         lines.append("command: " + " ".join(str(part) for part in command))
+    processes = context.get("processes") or []
+    if len(processes) > 1:
+        for proc in processes:
+            parent = proc.get("parent_process")
+            how = "forked from" if proc.get("forked") else "started by"
+            origin = f"{how} process {parent}" if parent else "the first"
+            end = "" if proc.get("complete") else ", no end record"
+            lines.append(
+                f"process {proc['process']}: {origin}, "
+                f"{_plural(proc['calls'], 'call')}, "
+                f"{_plural(proc['exceptions'], 'exception')}{end}"
+            )
     for group in doc["swallowed"]:
         raised = group["raised_at"]
         where = _place(raised[0]) if raised else "?"
@@ -487,6 +531,81 @@ def _diff(doc: Doc) -> list[str]:
     return lines
 
 
+def _state(entry: Doc) -> str:
+    if entry.get("mode") == "record" and entry.get("exit_code") is None:
+        state = "record() block"
+    elif entry.get("exit_code") is None:
+        state = "no exit code"
+    else:
+        state = f"exit {entry['exit_code']}"
+        if entry.get("signal"):
+            state += f" (signal {entry['signal']})"
+    if entry.get("running"):
+        state += ", running"
+    elif not entry.get("complete"):
+        state += ", incomplete"
+    return state
+
+
+def _list_line(entry: Doc) -> str:
+    counts = (
+        f"{_plural(entry['processes'], 'process', 'processes')}, "
+        f"{_plural(entry['calls'], 'call')}, "
+        f"{_plural(entry['exceptions'], 'exception')} ({entry['swallowed']} swallowed)"
+    )
+    if entry.get("io"):
+        counts += f", {entry['io']} io"
+    parts = [entry["recording"], entry.get("started_text") or "?", _state(entry)]
+    took = duration_text(entry.get("duration_s"))
+    if took:
+        parts.append(took)
+    parts.append(counts)
+    command = " ".join(str(part) for part in entry.get("command") or [])
+    if len(command) > 60:
+        command = "..." + command[-57:]  # the end says more: the script
+    if command:
+        parts.append(command)
+    return "  ".join(parts)
+
+
+def _list(doc: Doc) -> list[str]:
+    if not doc["total"]:
+        return [f"no recordings in {doc['root']}"]
+    shown = doc["recordings"]
+    lines = [
+        f"{_plural(doc['total'], 'recording')} in {doc['root']}, newest first"
+        + (f" (showing {len(shown)})" if len(shown) < doc["total"] else "")
+    ]
+    lines.extend(_list_line(entry) for entry in shown)
+    return lines
+
+
+def _status(doc: Doc) -> list[str]:
+    lines = [f"ormaos {doc['ormaos']} on Python {doc['python']} ({doc['executable']})"]
+    can = "yes" if doc["can_record"] else "no (needs Python 3.12 or newer)"
+    auto = "yes" if doc["starts_in_child_processes"] else "no (ormaos.pth is not there)"
+    lines.append(f"this Python can record: {can}; starts by itself under `run`: {auto}")
+    now = doc.get("recording_now")
+    lines.append(
+        f"this process is being recorded: {now}" if now else "not being recorded now"
+    )
+    if not doc["recordings"]:
+        lines.append(f"no recordings in {doc['root']}")
+        return lines
+    last = doc["last"]
+    lines.append(
+        f"{_plural(doc['recordings'], 'recording')} in {doc['root']}; "
+        f"last: {last['recording']}, {last.get('started_text') or '?'}, {_state(last)}"
+    )
+    if doc["running"]:
+        lines.append("running now: " + ", ".join(doc["running"]))
+    if doc["incomplete"]:
+        lines.append(
+            "incomplete (no end record, not running): " + ", ".join(doc["incomplete"])
+        )
+    return lines
+
+
 def _error(doc: Doc) -> list[str]:
     return [str(doc["error"])]
 
@@ -501,6 +620,8 @@ _RENDERERS = {
     "io": _io,
     "io_event": _io_event,
     "diff": _diff,
+    "list": _list,
+    "status": _status,
     "error": _error,
 }
 
