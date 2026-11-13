@@ -15,6 +15,15 @@ from types import TracebackType
 from typing import Any, Literal
 
 _ENV = ("ORMAOS_DIR", "ORMAOS_PATH", "ORMAOS_IO")
+# The one thing a block changes in the program it records. It is said in
+# every recording of a block.
+ENVIRONMENT_NOTE = {
+    "what": "the block as it runs without ormaos: its environment is changed",
+    "reason": "`with ormaos.record():` sets ORMAOS_DIR, ORMAOS_PATH and ORMAOS_IO "
+    "in os.environ while the block runs (the Python processes started inside "
+    "find the recording through them); when the block ends, each is put back "
+    "to the value the program had, or removed if it had none",
+}
 
 
 def _say(message: str) -> None:
@@ -82,10 +91,9 @@ class Session:
         target = _recorder._argv_shape().get("target")
         if target:
             command.append(str(target))
-        append(
-            os.path.join(directory, "run.jsonl"),
-            run_header(command, self._cwd, sorted(os.environ), "record"),
-        )
+        run_file = os.path.join(directory, "run.jsonl")
+        append(run_file, run_header(command, self._cwd, sorted(os.environ), "record"))
+        append(run_file, {"k": "not_collected", **ENVIRONMENT_NOTE})
         # The Python processes started inside the block find the recording
         # through the environment, as under `ormaos run`. It is put back when
         # the block ends.

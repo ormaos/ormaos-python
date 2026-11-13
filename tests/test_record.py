@@ -55,7 +55,10 @@ def test_a_block_is_recorded_and_the_script_runs_unchanged(work: Workdir) -> Non
     recording = work.last()
     assert recording.header["mode"] == "record"
     assert recording.header["command"] == [sys.executable, "app.py"]
-    assert recording.complete and recording.not_collected == []
+    assert recording.complete
+    # The one thing the block changes in the program is said in the recording.
+    (note,) = recording.not_collected
+    assert "ORMAOS_DIR, ORMAOS_PATH and ORMAOS_IO in os.environ" in note["reason"]
     # Only what ran inside the block: not `before`, not `after`.
     assert [call["fn"] for call in recording.calls] == ["work"]
     (exc,) = recording.exceptions
@@ -214,6 +217,71 @@ print("name", rec.name, "reason", rec.reason)
     assert result.stdout.splitlines()[0] == "ran 1"
     assert result.stdout.splitlines()[1].startswith("name None reason cannot start (")
     assert not (work.path / ".ormaos").exists()
+
+
+def test_the_environment_of_the_program_comes_back_as_it_was(work: Workdir) -> None:
+    source = """\
+import os, sys
+import ormaos
+
+def work():
+    return 1
+
+os.environ["ORMAOS_DIR"] = "/the/program/set/this"
+os.environ["ORMAOS_PATH"] = ""
+os.environ.pop("ORMAOS_IO", None)
+os.environ["ORMAOS_ONLY"] = "kept"
+before = dict(os.environ)
+
+with ormaos.record({options}) as rec:
+    work()
+    during = {{name: os.environ.get(name) for name in before | {{"ORMAOS_IO": 0}}}}
+print("recorded", rec.name)
+print("set during", during["ORMAOS_DIR"] == rec.directory, during["ORMAOS_IO"])
+print("same after", dict(os.environ) == before)
+
+try:
+    with ormaos.record():
+        raise KeyError("x")
+except KeyError:
+    pass
+print("same after an exception", dict(os.environ) == before)
+print("unset stays unset", "ORMAOS_IO" not in os.environ)
+print("empty stays empty", os.environ["ORMAOS_PATH"] == "")
+"""
+    work.write("app.py", source.format(options='path="work", io=False'))
+    result = work.plain(sys.executable, "app.py")
+    assert result.returncode == 0 and result.stderr == ""
+    assert result.stdout.splitlines() == [
+        "recorded r1",
+        "set during True 0",
+        "same after True",
+        "same after an exception True",
+        "unset stays unset True",
+        "empty stays empty True",
+    ]
+    # Said in the recording, and shown by `show`.
+    doc = json.loads(work.cli("show", "r1", "--json").stdout)
+    (note,) = [
+        n for n in doc["not_collected"] if n["what"].endswith("environment is changed")
+    ]
+    assert "ORMAOS_DIR, ORMAOS_PATH and ORMAOS_IO" in note["reason"]
+    assert "put back" in note["reason"] and "removed if it had none" in note["reason"]
+    assert "not collected: the block as it runs without ormaos" in (
+        work.cli("show", "r1").stdout
+    )
+
+    # A block that cannot record changes nothing either.
+    work.write("not-a-folder", "")
+    work.write("app.py", source.format(options='root="not-a-folder"'))
+    result = work.plain(sys.executable, "app.py")
+    assert result.stdout.splitlines()[0] == "recorded None"
+    assert result.stdout.splitlines()[2:] == [
+        "same after True",
+        "same after an exception True",
+        "unset stays unset True",
+        "empty stays empty True",
+    ]
 
 
 def test_a_notebook_cell_is_user_code(work: Workdir) -> None:
