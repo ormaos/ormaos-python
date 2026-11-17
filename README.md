@@ -310,7 +310,7 @@ The cost:
 
 What a recording can miss (each is said in `not_collected` when it happens, unless noted):
 
-- A Python that the command starts without `ormaos` installed, without its site packages (`-S`), or without `ORMAOS_DIR` in its environment is not recorded. When the recorded program started it with `subprocess`, the recording says how many are missing. When no Python at all was recorded, it says that.
+- A Python that the command starts without `ormaos` installed, without its site packages (`-S`), or without `ORMAOS_DIR` in its environment is not recorded. When the recorded program started it with `subprocess`, the recording says how many are missing; that count comes from the I/O events, so with `--no-io` it is not made, and `not_collected` says that it was not checked. When no Python at all was recorded, it says that.
 - A process that is killed loses the events it had not written yet: at most 256 records, or what arrived in its last 0.2 seconds.
 - A thread that was already running when a `with ormaos.record():` block started: only the calls it starts inside the block are recorded, with nothing above them. The function that contains the block is not a call of the recording.
 - At the recursion limit, the recorder has no room to note an event: calls and exceptions around that point can be missing or lack their end. The recording says how often.

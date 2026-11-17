@@ -158,7 +158,15 @@ NOT_COLLECTED = [
         "library threads and interpreter exit (counted when it happens)",
     },
 ]
-NOT_COLLECTED_OFF = [{"what": "io", "reason": "I/O recording was turned off (--no-io)"}]
+NOT_COLLECTED_OFF = [
+    {"what": "io", "reason": "I/O recording was turned off (--no-io)"},
+    {
+        "what": "whether the Python programs a process started reported",
+        "reason": "not checked: the Python programs a process starts are "
+        "counted from its subprocess events, and I/O recording was turned off "
+        "(--no-io)",
+    },
+]
 
 
 def _int_env(name: str, default: int) -> int:

@@ -61,6 +61,38 @@ main()
     assert not [n for n in notes(work) if "Python programs" in n["what"]]
 
 
+def test_without_io_the_child_pythons_are_said_to_be_unchecked(
+    work: Workdir,
+) -> None:
+    work.write(
+        "app.py",
+        "import subprocess, sys\n"
+        "def main():\n"
+        '    subprocess.run([sys.executable, "-S", "-c", "pass"], check=True)\n'
+        "main()\n",
+    )
+    unchecked = {
+        "what": "whether the Python programs a process started reported",
+        "reason": "not checked: the Python programs a process starts are "
+        "counted from its subprocess events, and I/O recording was turned off "
+        "(--no-io)",
+        "always": True,
+    }
+
+    result = work.cli("run", "--no-io", "--", sys.executable, "app.py")
+    assert result.returncode == 0
+    doc = json.loads(work.cli("show", "--json").stdout)
+    assert unchecked in doc["not_collected"]
+    assert not [n for n in doc["not_collected"] if "Python programs that" in n["what"]]
+
+    # With I/O, the child that did not report is counted instead.
+    assert work.python("app.py").returncode == 0
+    doc = json.loads(work.cli("show", "--json").stdout)
+    assert unchecked["what"] not in [n["what"] for n in doc["not_collected"]]
+    (note,) = [n for n in doc["not_collected"] if "Python programs that" in n["what"]]
+    assert note["what"].startswith("1 of the 1 Python programs that process 1")
+
+
 def test_threads_older_than_a_block_are_said(work: Workdir) -> None:
     source = """\
 import threading, time
