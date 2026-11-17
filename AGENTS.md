@@ -2,7 +2,7 @@
 
 ## What this repository is
 
-Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent. This repository holds the recorder and the CLI, in one package named `ormaos`. It is being built for the Hack Brasil 2026 hackathon; the deadline is **Nov 30, 2026, 23:59 (America/Sao_Paulo)**.
+Ormaos records what happened inside a Python execution and hands it to the developer and to their coding agent. This repository holds the recorder and the CLI, in one package named `ormaos`. It was built for the Hack Brasil 2026 hackathon.
 
 Public, Apache 2.0. The demo app lives in the sibling repository `ormaos-examples`.
 
