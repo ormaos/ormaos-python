@@ -323,7 +323,14 @@ Tested on Linux only.
 
 ## Overhead
 
-Measurements are coming.
+Measured on one machine: AMD Ryzen 7 7735HS with Radeon Graphics, 16 logical CPUs, x86_64; Linux-7.0.0-43-generic-x86_64-with-glibc2.43; CPython 3.13.17; N = 20 runs of each row; 2026-11-17 16:47 -03. Each time is the whole command, in milliseconds of wall-clock time. With Ormaos, it includes starting the CLI and reading the recording back for the summary.
+
+| Workload | Median without Ormaos (ms) | Median with the default, `ormaos run -- python` (ms) | Ratio | Source |
+|---|---:|---:|---:|---|
+| CPU: 150,000 calls of very small functions | 81.7 | 2666.2 | x32.63 | [bench/RESULTS.md](bench/RESULTS.md#cpu-bound-workload) |
+| I/O: a SQLite file, and small files written and read back | 33.1 | 222.6 | x6.71 | [bench/RESULTS.md](bench/RESULTS.md#io-workload) |
+
+The CPU workload is the worst case: the cost grows with the number of calls. [bench/RESULTS.md](bench/RESULTS.md) has the other capability sets (context only, without I/O, with `--path`), the spread of the runs, and what each recording held.
 
 ## Not yet
 
