@@ -34,6 +34,8 @@ ormaos: not collected: io: reads of the 1 file opened at fetch.py:26: opened for
 ormaos: saved in .ormaos/r1, next: ormaos exceptions r1:e1 | ormaos tree r1:c1
 ```
 
+The examples in this README are the output on Python 3.14. On 3.12 and 3.13 the number of calls and the addresses are not the same: each version builds the demo's dataclass with its own number of calls (code that Python generates from a string, and on 3.14 an `__annotate__` function).
+
 The last line gives the next commands. The first one:
 
 ```
@@ -183,6 +185,8 @@ How it is observed. Ormaos replaces and wraps nothing: `open` is still `open`, a
 
 ### Two recordings: `ormaos diff`
 
+Here `r3` is a run after a fix in `parse.py` that cleans the SKU when a row is read (`sku=row["sku"].strip().upper(),`).
+
 ```
 $ ormaos diff r1 r3
 r1 -> r3, matched by place in the code and order, not by address
@@ -190,13 +194,20 @@ r1 -> r3, matched by place in the code and order, not by address
   r3: exit 0, 346 calls, 1 exception, 218 io events
 calls: 6 of 31 places differ
   check_order at validate.py:47: 36 calls in both; 6 raised in r1, none in r3; call 7 raised in r1 and returned in r3  [r1:c167 r3:c167]
+  check_sku at validate.py:22: 36 calls in both; 6 raised in r1, none in r3; call 7 raised in r1 and returned in r3  [r1:c168 r3:c168]
+  check_quantity at validate.py:27: 30 calls in r1, 36 in r3  [r1:c133 r3:c133]
+  check_unit at validate.py:42: 30 calls in r1, 36 in r3  [r1:c134 r3:c134]
   apply_order at inventory.py:78: 30 calls in r1, 36 in r3  [r1:c135 r3:c135]
-  ...
+  to_units at inventory.py:71: 30 calls in r1, 36 in r3  [r1:c136 r3:c136]
 exceptions: 1 of 2 groups differ
   swallowed validate.SkuFormatError, raised at validate.py:24, handled at job.py:57: 6 in r1, none in r3  [r1:e1]
 io: 6 of 8 groups differ
+  sqlite SELECT on_hand, pack_size FROM stock WHERE sku = ?  at inventory.py:87 in apply_order: 30 in r1, 36 in r3  [r1:i3 r3:i3]
+  sqlite SELECT ? FROM applied_orders WHERE order_id = ?  at inventory.py:92 in apply_order: 30 in r1, 36 in r3  [r1:i4 r3:i4]
+  sqlite BEGIN  at inventory.py:101 in apply_order: 30 in r1, 36 in r3  [r1:i5 r3:i5]
   sqlite UPDATE stock SET on_hand = on_hand - ? WHERE sku = ?  at inventory.py:101 in apply_order: 30 in r1, 36 in r3  [r1:i6 r3:i6]
-  ...
+  sqlite INSERT INTO applied_orders (order_id, sku, quantity, applied_at) VALU...  at inventory.py:105 in apply_order: 30 in r1, 36 in r3  [r1:i7 r3:i7]
+  sqlite COMMIT  at inventory.py:100 in apply_order: 30 in r1, 36 in r3  [r1:i8 r3:i8]
 not compared: values, shapes of arguments and results, durations, cpu and memory, the lines of `path`, which process or thread an event was in
 next: ormaos exceptions r1:e1 | ormaos tree r1:c167 | ormaos io r1:i3 | ormaos tree r3:c167 | ormaos io r3:i3
 ```

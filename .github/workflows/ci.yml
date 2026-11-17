@@ -56,7 +56,7 @@ jobs:
           uv venv ../ormaos-examples/order-sync/.venv
           uv pip install --python ../ormaos-examples/order-sync/.venv/bin/python .
       - name: Demo tests with the demo's environment
-        run: uv run pytest tests/test_demo.py
+        run: uv run pytest tests/test_demo.py tests/test_readme.py
         env:
           ORMAOS_DEMO_REQUIRED: "1"
           ORMAOS_DEMO_PYTHON: ${{ github.workspace }}/ormaos-examples/order-sync/.venv/bin/python
